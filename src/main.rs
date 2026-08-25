@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use chrono::Local;
-use protector::auth::{self, TokenStore};
+use protector::auth;
 use protector::config;
 use protector::core::{
     apply, derive_ui, end_candidates, tick, token_revoked, warn_before_secs, AppState, Effect,
@@ -9,6 +9,7 @@ use protector::core::{
 use protector::notify;
 use protector::state::{load, restore_selection, save, state_path, PersistedState};
 use protector::sync;
+use protector::token_store::{self, TokenStore};
 use protector::tray::menu_model::Action;
 use protector::tray::{self, Command};
 use tokio::sync::mpsc;
@@ -54,8 +55,8 @@ async fn main() {
 
 /// Picking a token store touches the Secret Service, which blocks. Off the
 /// runtime thread it goes — once per process, then it is cached.
-async fn token_store() -> anyhow::Result<&'static dyn TokenStore> {
-    Ok(tokio::task::spawn_blocking(auth::token_store).await?)
+async fn selected_store() -> anyhow::Result<&'static dyn TokenStore> {
+    Ok(tokio::task::spawn_blocking(token_store::token_store).await?)
 }
 
 fn require_configured() -> anyhow::Result<config::Config> {
@@ -100,18 +101,18 @@ async fn connect_account(cfg: &config::Config) -> anyhow::Result<(&'static str, 
              https://myaccount.google.com/permissions and run `protector login` again."
         )
     })?;
-    let store = token_store().await?;
+    let store = selected_store().await?;
     let where_ = store.describe();
     let stale = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<&'static str>> {
         // Installed through the guard: any token write still in flight from an
         // earlier connection is a generation behind this one and is discarded.
-        auth::token_writes().install(store, &refresh)?;
+        token_store::token_writes().install(store, &refresh)?;
         // Exactly one copy may survive a login. An older token left in the store
         // that was *not* selected this run stays valid at Google, is invisible to
         // `status`, and would be missed by a later `logout` that happens to
         // select the other store. Best effort: a keyring that will not answer
         // must not fail a login that has already succeeded.
-        Ok(auth::all_token_stores()
+        Ok(token_store::all_token_stores()
             .into_iter()
             .filter(|other| other.describe() != where_)
             .filter(|other| other.clear().is_err())
@@ -124,10 +125,10 @@ async fn connect_account(cfg: &config::Config) -> anyhow::Result<(&'static str, 
 }
 
 async fn logout() -> anyhow::Result<()> {
-    // Every store, not the one `token_store()` would select today: the token may
+    // Every store, not the one `selected_store()` would select today: the token may
     // well have been written by an earlier run that chose differently, and a
     // revocation that silently misses it is worse than no revocation at all.
-    let outcomes = tokio::task::spawn_blocking(|| auth::token_writes().revoke_all_stores()).await?;
+    let outcomes = tokio::task::spawn_blocking(|| token_store::token_writes().revoke_all_stores()).await?;
 
     let mut unrevoked = Vec::new();
     for (where_, outcome) in &outcomes {
@@ -158,7 +159,7 @@ async fn logout() -> anyhow::Result<()> {
 async fn status() -> anyhow::Result<()> {
     let config_file = config::config_path();
     let cfg = config::load_or_create(&config_file)?;
-    let store = token_store().await?;
+    let store = selected_store().await?;
     let where_ = store.describe();
     // Only ever asked *whether* there is a token. The value is never printed,
     // and never leaves this function.
@@ -314,7 +315,7 @@ async fn forget_account() {
         // discarded for being a generation behind. Aborting the sync task
         // cannot achieve that: a dispatched `spawn_blocking` write runs to
         // completion whatever happens to its handle.
-        for (where_, outcome) in auth::token_writes().revoke_all_stores() {
+        for (where_, outcome) in token_store::token_writes().revoke_all_stores() {
             if let Err(e) = outcome {
                 eprintln!("protector: could not clear the {where_}: {e:#}");
             }
@@ -334,7 +335,7 @@ async fn run() -> anyhow::Result<()> {
     // starts and says `Not connected` in the panel, which is where a first-time
     // user is looking, rather than exiting with a message they never see.
     let cfg = config::load_or_create(&config::config_path())?;
-    let store = auth::shared_token_store();
+    let store = token_store::shared_token_store();
 
     let now = Local::now();
     let persisted = load(&state_file);

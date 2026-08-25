@@ -13,11 +13,12 @@ use std::time::Duration;
 use chrono::{DateTime, Local};
 use tokio::sync::mpsc;
 
-use crate::auth::{self, TokenStore, TokenWrites, Tokens};
+use crate::auth::{self, Tokens};
 use crate::calendar;
 use crate::config::Config;
 use crate::core::{backoff, reconcile, AppState, Effect};
 use crate::task::Task;
+use crate::token_store::{token_writes, TokenStore, TokenWrites};
 use crate::tray::Command;
 
 /// The unattended sync period (spec §6).
@@ -86,7 +87,7 @@ impl Syncer {
             token_endpoint,
             tokens: None,
             request_timeout: REQUEST_TIMEOUT,
-            writes: auth::token_writes(),
+            writes: token_writes(),
         }
     }
 
@@ -313,7 +314,8 @@ fn out_of_window(state: &AppState, fresh: &[Task], now: DateTime<Local>) -> bool
 /// no further than that. Work already handed to `tokio::task::spawn_blocking`
 /// — which is how every token-store write is made — runs to completion
 /// regardless, so this is emphatically **not** a guarantee that nothing more
-/// will be written after the drop. What guarantees that is `auth::TokenWrites`:
+/// will be written after the drop. What guarantees that is
+/// `token_store::TokenWrites`:
 /// a write dispatched before a revocation either lands before the clear that
 /// follows it, or is dropped for being a generation behind.
 pub struct SyncHandle {
@@ -390,7 +392,7 @@ async fn run(mut syncer: Syncer, mut requests: mpsc::Receiver<()>, tx: mpsc::Sen
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::FileStore;
+    use crate::token_store::FileStore;
     use crate::core::{apply, derive_ui};
     use crate::task::Selection;
     use crate::tray::menu_model::Action;
@@ -434,7 +436,7 @@ mod tests {
     }
 
     /// A syncer whose token writes are guarded by `writes`. Tests always pass an
-    /// instance of their own rather than `auth::token_writes()`: on the shared
+    /// instance of their own rather than the process-wide `token_writes()`: on the shared
     /// guard, one test's revocation would invalidate another's write.
     fn syncer_guarded(
         server: &MockServer,
