@@ -152,7 +152,6 @@ pub const API_BASE: &str = "https://www.googleapis.com/calendar/v3";
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeZone;
 
     fn fixture() -> Vec<GoogleEvent> {
         let raw = include_str!("../tests/fixtures/events.json");
@@ -161,7 +160,14 @@ mod tests {
     }
 
     fn at(h: u32, m: u32) -> DateTime<Local> {
-        Local.with_ymd_and_hms(2026, 8, 25, h, m, 0).unwrap()
+        // Built from a fixed +02:00 offset (matching the fixture's events)
+        // rather than the host's local wall clock, so the instant this
+        // represents is the same absolute moment under any TZ the test
+        // process runs in.
+        format!("2026-08-25T{h:02}:{m:02}:00+02:00")
+            .parse::<DateTime<chrono::FixedOffset>>()
+            .unwrap()
+            .with_timezone(&Local)
     }
 
     fn cfg() -> Config {
@@ -220,12 +226,14 @@ mod tests {
             .and(path("/calendars/primary/events"))
             .and(header("authorization", "Bearer stale"))
             .respond_with(ResponseTemplate::new(401))
+            .expect(1)
             .mount(&server)
             .await;
         Mock::given(method("GET"))
             .and(path("/calendars/primary/events"))
             .and(header("authorization", "Bearer fresh"))
             .respond_with(ResponseTemplate::new(200).set_body_string(include_str!("../tests/fixtures/events.json")))
+            .expect(1)
             .mount(&server)
             .await;
 
