@@ -525,12 +525,15 @@ async fn run() -> anyhow::Result<()> {
                 // selection in hand, so the `if let` below is not a silent
                 // no-op path in practice — it just avoids trusting that from
                 // a distance.
-                Effect::NotifyWarning => {
+                Effect::NotifyWarning(remaining) => {
                     if let Some(sel) = state.selection.as_ref() {
-                        // The very value `tick` gated on, so `15 minutes left`
-                        // can never appear five minutes before the end.
-                        let minutes = state.warn_before_secs / 60;
-                        if let Err(e) = notify::notify_warning(&conn, &sel.task, minutes).await {
+                        // The seconds `tick` measured, carried on the effect
+                        // itself. `state.warn_before_secs` — the configured
+                        // *window* — is deliberately not consulted here: it is
+                        // only an upper bound on the time left, so rendering it
+                        // announced `30 minutes left` on a block picked four
+                        // minutes before it ended.
+                        if let Err(e) = notify::notify_warning(&conn, &sel.task, *remaining).await {
                             eprintln!("protector: failed to send the warning notification: {e}");
                         }
                     }

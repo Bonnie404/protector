@@ -60,7 +60,17 @@ pub enum Effect {
     StartLogin,
     Logout,
     Quit,
-    NotifyWarning,
+    /// The heads-up before the selected block ends, carrying the seconds that
+    /// were actually left when it fired.
+    ///
+    /// The number travels with the effect rather than being recomputed at the
+    /// notification site, because the only other number in reach there is
+    /// `warn_before_secs` — the configured *window* — and rendering that is
+    /// exactly the bug this payload exists to make unrepresentable. The window
+    /// is an upper bound on this value, never equal to it except by
+    /// coincidence: a block selected four minutes before it ends warns on the
+    /// next tick however wide the window is.
+    NotifyWarning(i64),
     NotifyEnded,
     /// The selected event is gone from the calendar; the countdown it was
     /// driving has been dropped and the user has to be told, since nothing on
@@ -264,7 +274,7 @@ pub fn tick(state: &mut AppState, now: DateTime<Local>) -> Vec<Effect> {
         // above has already handled everything at or past the end.
         } else if remaining > 0 && remaining <= warn_before && !sel.warned {
             sel.warned = true;
-            effects.push(Effect::NotifyWarning);
+            effects.push(Effect::NotifyWarning(remaining));
             effects.push(Effect::Persist);
         }
     }
@@ -507,7 +517,7 @@ mod tests {
         // window, well outside the default 5 minute one.
         let effects = tick(&mut state, at(15, 20));
         assert!(
-            effects.iter().any(|e| matches!(e, Effect::NotifyWarning)),
+            effects.iter().any(|e| matches!(e, Effect::NotifyWarning(_))),
             "a 15 minute window must warn 10 minutes out: {effects:?}"
         );
 
@@ -515,8 +525,24 @@ mod tests {
         apply(&mut default_window, &Action::SelectTask("e1".into()));
         let effects = tick(&mut default_window, at(15, 20));
         assert!(
-            !effects.iter().any(|e| matches!(e, Effect::NotifyWarning)),
+            !effects.iter().any(|e| matches!(e, Effect::NotifyWarning(_))),
             "and the default 5 minute window must not: {effects:?}"
+        );
+    }
+
+    #[test]
+    fn the_warning_carries_the_time_left_rather_than_the_configured_window() {
+        // A block picked with four minutes to go, under a 30 minute window:
+        // the heads-up fires on the very next tick, and the number it carries
+        // has to be the four minutes, not the thirty. `main` had nothing but
+        // the window to render, so the panel said `30 minutes left`.
+        let mut state = connected_state();
+        state.warn_before_secs = warn_before_secs(30);
+        apply(&mut state, &Action::SelectTask("e1".into()));
+        let effects = tick(&mut state, at(15, 26));
+        assert!(
+            effects.contains(&Effect::NotifyWarning(240)),
+            "expected the four minutes actually left: {effects:?}"
         );
     }
 
@@ -528,7 +554,7 @@ mod tests {
         for minute in 20..30 {
             let effects = tick(&mut state, at(15, minute));
             assert!(
-                !effects.iter().any(|e| matches!(e, Effect::NotifyWarning)),
+                !effects.iter().any(|e| matches!(e, Effect::NotifyWarning(_))),
                 "a zero window must never warn (at 15:{minute}): {effects:?}"
             );
         }
@@ -560,8 +586,8 @@ mod tests {
         apply(&mut state, &Action::SelectTask("e1".into()));
         let first = tick(&mut state, at(15, 26));
         let second = tick(&mut state, at(15, 27));
-        assert!(first.iter().any(|e| matches!(e, Effect::NotifyWarning)));
-        assert!(!second.iter().any(|e| matches!(e, Effect::NotifyWarning)));
+        assert!(first.iter().any(|e| matches!(e, Effect::NotifyWarning(_))));
+        assert!(!second.iter().any(|e| matches!(e, Effect::NotifyWarning(_))));
     }
 
     #[test]

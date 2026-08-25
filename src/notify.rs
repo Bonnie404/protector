@@ -126,10 +126,36 @@ pub async fn notify_ended(conn: &Connection, ended: &Task, candidates: &[Task]) 
         .await
 }
 
+/// The heads-up's summary line, from the seconds actually left on the block.
+///
+/// Deliberately *not* the configured window: with `warn_before_minutes = 30`
+/// and a block selected four minutes before it ends, the heads-up fires on the
+/// very next tick, and rendering the window there announced "30 minutes left"
+/// on a block with four. The window is only ever an upper bound on this number
+/// — `core::tick` fires the warning when `remaining <= warn_before_secs` — so
+/// taking the remaining time needs no separate clamp.
+///
+/// Rounded **up**, so the ordinary case still reads as the window the user
+/// configured: a 1 Hz ticker sees 29:58 rather than a clean 30:00, and
+/// `29 minutes left` for a heads-up that exists to say "half an hour" would be
+/// its own small lie. Rounding up also keeps the last minute from reading
+/// `0 minutes left`.
+pub fn warning_summary(task: &Task, remaining_secs: i64) -> String {
+    // `.max(1)` covers the theoretical zero — `tick` only fires this with
+    // `remaining > 0` — and keeps the ceiling from producing a `0`.
+    let minutes = remaining_secs.max(1).saturating_add(59) / 60;
+    let unit = if minutes == 1 { "minute" } else { "minutes" };
+    format!("{minutes} {unit} left \u{b7} {}", task.title)
+}
+
 /// The T-5 heads-up: low urgency, no actions, and left to expire on its own
 /// (`expire_timeout` -1, the server's normal default) — a nudge, not
 /// something that has to be dealt with.
-pub async fn notify_warning(conn: &Connection, task: &Task, minutes: i64) -> zbus::Result<u32> {
+///
+/// Takes the seconds left rather than a minute count so that the one number
+/// the caller has — the remaining time `tick` measured — is the one that gets
+/// rendered, with no arithmetic in between for a window to sneak into.
+pub async fn notify_warning(conn: &Connection, task: &Task, remaining_secs: i64) -> zbus::Result<u32> {
     let proxy = NotificationsProxy::new(conn).await?;
     let mut hints = HashMap::new();
     hints.insert("urgency", Value::U8(0));
@@ -138,7 +164,7 @@ pub async fn notify_warning(conn: &Connection, task: &Task, minutes: i64) -> zbu
             "Protector",
             0,
             "alarm-symbolic",
-            &format!("{minutes} minutes left \u{b7} {}", task.title),
+            &warning_summary(task, remaining_secs),
             "",
             &[],
             hints,
@@ -274,6 +300,37 @@ mod tests {
     fn an_empty_day_produces_only_the_dismiss_button() {
         assert_eq!(ended_actions(&[]), vec!["none".to_string(), "Nothing".to_string()]);
         assert_eq!(ended_body(&[]), "Nothing else is scheduled today.");
+    }
+
+    // ---- The heads-up's wording ---------------------------------------------
+
+    #[test]
+    fn the_heads_up_states_the_time_that_is_actually_left() {
+        // The ordinary case: a 30 minute window, crossed on a tick that sees
+        // 29:58 rather than a clean 30:00.
+        let t = task("e1", "Design review", 14, 0);
+        assert_eq!(warning_summary(&t, 1798), "30 minutes left \u{b7} Design review");
+        // And the documented default window.
+        assert_eq!(warning_summary(&t, 299), "5 minutes left \u{b7} Design review");
+    }
+
+    #[test]
+    fn a_block_selected_inside_the_window_is_not_announced_as_the_whole_window() {
+        // `warn_before_minutes = 30`, and the user picks a block with four
+        // minutes to go: the heads-up fires on the very next tick. Rendering
+        // the *window* here told them they had half an hour.
+        let t = task("e1", "Design review", 14, 0);
+        assert_eq!(warning_summary(&t, 239), "4 minutes left \u{b7} Design review");
+    }
+
+    #[test]
+    fn a_one_minute_window_reads_as_one_minute_singular() {
+        let t = task("e1", "Design review", 14, 0);
+        assert_eq!(warning_summary(&t, 60), "1 minute left \u{b7} Design review");
+        // Anywhere inside the last minute says the same thing, never "0".
+        assert_eq!(warning_summary(&t, 1), "1 minute left \u{b7} Design review");
+        // And one second past it is plural again.
+        assert_eq!(warning_summary(&t, 61), "2 minutes left \u{b7} Design review");
     }
 
     #[test]

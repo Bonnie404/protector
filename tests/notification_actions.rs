@@ -229,7 +229,9 @@ async fn notify_warning_is_low_urgency_with_no_actions_and_expires_normally() {
     let (_server, client, calls) = fake_server(&bus).await;
 
     let t = task("e1", "Design review", 14, 0);
-    notify::notify_warning(&client, &t, 5).await.unwrap();
+    // Seconds left, not minutes: what reaches the wire is the time actually
+    // remaining on the block, rounded up to whole minutes.
+    notify::notify_warning(&client, &t, 299).await.unwrap();
 
     let calls = calls.lock().unwrap();
     assert_eq!(calls.len(), 1);
