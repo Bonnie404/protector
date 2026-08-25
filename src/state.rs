@@ -39,7 +39,8 @@ impl PersistedState {
 
 pub fn state_path() -> PathBuf {
     dirs::state_dir()
-        .unwrap_or_else(|| dirs::home_dir().unwrap().join(".local/state"))
+        .or_else(|| dirs::home_dir().map(|h| h.join(".local/state")))
+        .unwrap_or_else(|| PathBuf::from(".local/state"))
         .join("protector/state.json")
 }
 
@@ -84,6 +85,10 @@ pub fn restore_selection(p: &PersistedState, now: DateTime<Local>) -> Option<Sel
 mod tests {
     use super::*;
     use chrono::TimeZone;
+
+    fn state_path_with_base(base: &Path) -> PathBuf {
+        base.join("protector/state.json")
+    }
 
     fn at(h: u32, m: u32) -> DateTime<Local> { Local.with_ymd_and_hms(2026, 8, 25, h, m, 0).unwrap() }
 
@@ -131,5 +136,18 @@ mod tests {
     fn a_selection_that_ended_long_ago_is_dropped() {
         let p = PersistedState::from_selection(Some(&selection(at(15, 30))), None);
         assert!(restore_selection(&p, at(17, 0)).is_none());
+    }
+
+    #[test]
+    fn state_path_with_a_known_base_returns_the_correct_suffix() {
+        let base = PathBuf::from("/home/user/.local/state");
+        let path = state_path_with_base(&base);
+        assert_eq!(path, PathBuf::from("/home/user/.local/state/protector/state.json"));
+    }
+
+    #[test]
+    fn state_path_returns_a_path_ending_in_protector_state_json() {
+        let path = state_path();
+        assert!(path.ends_with("protector/state.json"));
     }
 }

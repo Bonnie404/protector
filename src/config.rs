@@ -38,7 +38,8 @@ warn_before_minutes = 5
 
 pub fn config_path() -> PathBuf {
     dirs::config_dir()
-        .unwrap_or_else(|| dirs::home_dir().unwrap().join(".config"))
+        .or_else(|| dirs::home_dir().map(|h| h.join(".config")))
+        .unwrap_or_else(|| PathBuf::from(".config"))
         .join("protector/config.toml")
 }
 
@@ -62,6 +63,10 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn config_path_with_base(base: &Path) -> PathBuf {
+        base.join("protector/config.toml")
+    }
 
     #[test]
     fn a_missing_config_is_created_from_the_template_and_reports_incomplete() {
@@ -92,5 +97,18 @@ mod tests {
         let path = dir.path().join("config.toml");
         std::fs::write(&path, "client_id = ").unwrap();
         assert!(load_or_create(&path).is_err());
+    }
+
+    #[test]
+    fn config_path_with_a_known_base_returns_the_correct_suffix() {
+        let base = std::path::PathBuf::from("/home/user/.config");
+        let path = config_path_with_base(&base);
+        assert_eq!(path, std::path::PathBuf::from("/home/user/.config/protector/config.toml"));
+    }
+
+    #[test]
+    fn config_path_returns_a_path_ending_in_protector_config_toml() {
+        let path = config_path();
+        assert!(path.ends_with("protector/config.toml"));
     }
 }
