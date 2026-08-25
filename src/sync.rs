@@ -268,6 +268,10 @@ pub fn apply_sync(
             state.tasks_later = later;
             state.last_error = None;
             state.last_sync = Some(now);
+            // The lists above are now an actual answer about today, which is
+            // what lets the menu say `Nothing scheduled today` when they are
+            // empty rather than `Loading today…`.
+            state.synced = true;
             if out_of_window(state, &tasks, now) {
                 // Nothing to reconcile against: see `out_of_window`.
                 state.revision += 1;

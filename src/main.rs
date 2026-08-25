@@ -3,7 +3,9 @@ use std::sync::Arc;
 use chrono::Local;
 use protector::auth::{self, TokenStore};
 use protector::config;
-use protector::core::{apply, derive_ui, tick, token_revoked, warn_before_secs, AppState, Effect};
+use protector::core::{
+    apply, derive_ui, end_candidates, tick, token_revoked, warn_before_secs, AppState, Effect,
+};
 use protector::notify;
 use protector::state::{load, restore_selection, save, state_path, PersistedState};
 use protector::sync;
@@ -524,7 +526,12 @@ async fn run() -> anyhow::Result<()> {
                 }
                 Effect::NotifyEnded => {
                     if let Some(sel) = state.selection.as_ref() {
-                        if let Err(e) = notify::notify_ended(&conn, &sel.task, &state.tasks_later).await {
+                        // Not `state.tasks_later` alone: a block already
+                        // running when this one ended is the soonest thing to
+                        // switch to, and used to get neither a button nor a
+                        // mention. See `core::end_candidates`.
+                        let candidates = end_candidates(&state, &sel.task);
+                        if let Err(e) = notify::notify_ended(&conn, &sel.task, &candidates).await {
                             eprintln!("protector: failed to send the end-of-task notification: {e}");
                         }
                     }

@@ -13,6 +13,21 @@ pub struct AppState {
     pub last_sync: Option<DateTime<Local>>,
     pub last_error: Option<String>,
     pub revision: u32,
+    /// Whether `tasks_now`/`tasks_later` are what a sync actually returned.
+    ///
+    /// An empty list is only evidence of a free day if a sync put it there.
+    /// Before the first one lands — a cold start, a first run with no network
+    /// — the lists are empty because nothing has filled them yet, which is a
+    /// different thing entirely and must not be reported as `Nothing
+    /// scheduled today`. Cleared again whenever the lists are emptied by
+    /// something other than a sync, so a reconnect does not inherit the
+    /// previous account's answer.
+    ///
+    /// Deliberately not `last_sync.is_some()`: `last_sync` is restored from
+    /// `state.json` at startup so the offline marker can say *when*, which
+    /// would make a second run claim a free day before it had fetched
+    /// anything.
+    pub synced: bool,
     /// How long before the selected task ends the heads-up fires, from
     /// `config.warn_before_minutes` (spec §8) via [`warn_before_secs`].
     /// Held here rather than read from the config at the notification site,
@@ -33,6 +48,7 @@ impl Default for AppState {
             last_sync: None,
             last_error: None,
             revision: 0,
+            synced: false,
             warn_before_secs: WARN_BEFORE_SECS,
         }
     }
@@ -98,7 +114,13 @@ pub fn derive_ui(state: &AppState, now: DateTime<Local>) -> UiState {
 
     if state.connected {
         if state.tasks_now.is_empty() && state.tasks_later.is_empty() {
-            items.push(MenuItem::disabled(id, "Nothing scheduled today"));
+            // Two different empty menus, and saying the wrong one is a claim
+            // the program cannot back: `Nothing scheduled today` above
+            // `⚠ Offline — synced never` told a first-run user with no network
+            // that their day was free.
+            let empty =
+                if state.synced { "Nothing scheduled today" } else { "Loading today\u{2026}" };
+            items.push(MenuItem::disabled(id, empty));
             id += 1;
         } else {
             push_tasks(&mut items, &mut id, &state.tasks_now, selected_id);
@@ -153,6 +175,36 @@ pub fn derive_ui(state: &AppState, now: DateTime<Local>) -> UiState {
     }
 }
 
+/// What the end-of-block chooser offers once `ended` runs out, in
+/// chronological order: everything still running now, then everything later
+/// today.
+///
+/// `tasks_now` is chained in ahead of `tasks_later` rather than ignored,
+/// because a block that is *already running* is the soonest thing there is to
+/// switch to. Two ways that happens in practice: overlapping calendar
+/// entries, and a resume from suspend where the sync that ran on wake has
+/// already moved the next block out of `tasks_later` and into `tasks_now`.
+/// Drawing only from `tasks_later` gave neither of them a button — and
+/// `notify::ended_body` did not even name them, so they were invisible.
+///
+/// The order holds because `calendar::partition` splits an already
+/// start-ordered list at `now`: every `tasks_now` entry started at or before
+/// every `tasks_later` entry, so "the three soonest" stays true after the
+/// chain.
+///
+/// The block that just ended is excluded by id — it is usually still in
+/// `tasks_now`, since the next sync is up to five minutes away — because
+/// offering the user the thing they just finished is not a choice.
+pub fn end_candidates(state: &AppState, ended: &Task) -> Vec<Task> {
+    state
+        .tasks_now
+        .iter()
+        .filter(|t| t.id != ended.id)
+        .chain(state.tasks_later.iter())
+        .cloned()
+        .collect()
+}
+
 fn find_task<'a>(state: &'a AppState, id: &str) -> Option<&'a Task> {
     state.tasks_now.iter().chain(state.tasks_later.iter()).find(|t| t.id == id)
 }
@@ -180,6 +232,10 @@ pub fn apply(state: &mut AppState, action: &Action) -> Vec<Effect> {
             state.selection = None;
             state.tasks_now.clear();
             state.tasks_later.clear();
+            // The lists are empty because they were emptied, not because the
+            // day is free; reconnecting must wait for a real answer before
+            // claiming otherwise.
+            state.synced = false;
             // Leaving this set would hang a `⚠ Offline` item under
             // `Not connected` for the rest of the session. Choosing to
             // disconnect is not a failure to reach Google.
@@ -274,6 +330,8 @@ pub fn token_revoked(state: &mut AppState) -> Vec<Effect> {
     state.selection = None;
     state.tasks_now.clear();
     state.tasks_later.clear();
+    // Same reasoning as `Action::Disconnect`: emptied, not free.
+    state.synced = false;
     // Leaving this set would hang a `⚠ Offline` item under `Not connected`
     // for the rest of the session, same reasoning as `Action::Disconnect`.
     state.last_error = None;
@@ -313,6 +371,7 @@ mod tests {
             last_sync: Some(at(14, 3)),
             last_error: None,
             revision: 0,
+            synced: true,
             warn_before_secs: WARN_BEFORE_SECS,
         }
     }
@@ -363,6 +422,48 @@ mod tests {
         state.tasks_later.clear();
         let ui = derive_ui(&state, at(14, 6));
         assert!(ui.menu.items.iter().any(|i| i.label == "Nothing scheduled today" && !i.enabled));
+    }
+
+    #[test]
+    fn a_day_that_has_never_been_fetched_does_not_claim_to_be_free() {
+        // A first run with no network: the lists are empty because nothing
+        // has filled them, not because the calendar is.
+        let state = AppState { connected: true, last_error: Some("timeout".into()), ..Default::default() };
+        let ui = derive_ui(&state, at(14, 6));
+        let labels: Vec<&str> = ui.menu.items.iter().map(|i| i.label.as_str()).collect();
+        assert!(
+            !labels.contains(&"Nothing scheduled today"),
+            "claimed a free day without ever having asked: {labels:?}"
+        );
+        assert!(labels.iter().any(|l| l.starts_with("Loading today")), "{labels:?}");
+        assert!(labels.iter().any(|l| l.starts_with("\u{26a0} Offline")), "{labels:?}");
+    }
+
+    #[test]
+    fn a_second_run_does_not_inherit_yesterdays_sync_as_an_answer_about_today() {
+        // `last_sync` is restored from `state.json` so the offline marker can
+        // say *when* — which must not be mistaken for having fetched today.
+        let state = AppState { connected: true, last_sync: Some(at(9, 0)), ..Default::default() };
+        let labels: Vec<String> =
+            derive_ui(&state, at(14, 6)).menu.items.iter().map(|i| i.label.clone()).collect();
+        assert!(!labels.iter().any(|l| l == "Nothing scheduled today"), "{labels:?}");
+    }
+
+    #[test]
+    fn a_sync_that_really_did_come_back_empty_still_says_so() {
+        let mut state = connected_state();
+        state.tasks_now.clear();
+        state.tasks_later.clear();
+        assert!(state.synced);
+        let ui = derive_ui(&state, at(14, 6));
+        assert!(ui.menu.items.iter().any(|i| i.label == "Nothing scheduled today" && !i.enabled));
+    }
+
+    #[test]
+    fn disconnecting_stops_the_menu_claiming_the_next_account_has_a_free_day() {
+        let mut state = connected_state();
+        apply(&mut state, &Action::Disconnect);
+        assert!(!state.synced, "the lists were emptied, not fetched");
     }
 
     #[test]
@@ -474,6 +575,46 @@ mod tests {
             "disconnecting on purpose is not the same as being offline: {:?}",
             ui.menu.items.iter().map(|i| &i.label).collect::<Vec<_>>()
         );
+    }
+
+    // ---- What the end-of-block chooser offers --------------------------------
+
+    #[test]
+    fn a_block_already_running_when_the_selected_one_ends_is_offered_first() {
+        // Overlapping calendar entries, or a resume from suspend where the
+        // sync on wake already moved the next block into `tasks_now`.
+        let mut state = connected_state();
+        state.tasks_now.push(task("e9", "Pair programming", (14, 30), (16, 30)));
+        apply(&mut state, &Action::SelectTask("e1".into()));
+        let ended = state.selection.as_ref().unwrap().task.clone();
+
+        let ids: Vec<String> =
+            end_candidates(&state, &ended).into_iter().map(|t| t.id).collect();
+        assert_eq!(
+            ids,
+            vec!["e9", "e2"],
+            "the running block has to come first, and chronological order has to survive"
+        );
+    }
+
+    #[test]
+    fn the_block_that_just_ended_is_never_offered_back() {
+        let mut state = connected_state();
+        apply(&mut state, &Action::SelectTask("e1".into()));
+        let ended = state.selection.as_ref().unwrap().task.clone();
+        // e1 is still in `tasks_now` — the next sync is up to five minutes away.
+        assert!(state.tasks_now.iter().any(|t| t.id == "e1"));
+        let ids: Vec<String> =
+            end_candidates(&state, &ended).into_iter().map(|t| t.id).collect();
+        assert_eq!(ids, vec!["e2"]);
+    }
+
+    #[test]
+    fn an_empty_rest_of_day_offers_nothing_rather_than_failing() {
+        let mut state = connected_state();
+        state.tasks_later.clear();
+        let ended = state.tasks_now[0].clone();
+        assert!(end_candidates(&state, &ended).is_empty());
     }
 
     // ---- Reconciliation against a fresh sync --------------------------------
