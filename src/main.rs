@@ -1,13 +1,19 @@
 use chrono::Local;
 use protector::core::{apply, derive_ui, tick, AppState, Effect};
+use protector::state::{load, restore_selection, save, state_path, PersistedState};
 use protector::task::Task;
 use protector::tray::{self, Command};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Fixed for the process lifetime: computed once so every `Effect::Persist`
+    // in the run loop below writes to the same file `state_path()` names now.
+    let state_file = state_path();
+
     let mut state = AppState { connected: true, ..Default::default() };
-    // Hardcoded until Task 8; proves the loop end to end.
     let now = Local::now();
+    state.selection = restore_selection(&load(&state_file), now);
+    // Hardcoded until Task 8; proves the loop end to end.
     state.tasks_now = vec![Task {
         id: "e1".into(),
         title: "Design review".into(),
@@ -56,6 +62,22 @@ async fn main() -> anyhow::Result<()> {
             },
             Command::AboutToShow | Command::SecondaryActivate => vec![],
         };
+        // Checked as membership, not vector position, and always ahead of the
+        // Quit check below: `Action::Quit` currently produces `[Effect::Quit]`
+        // alone, but a tick or a selection change can hand back `Effect::Persist`
+        // in the very same batch a caller also asked to quit in, and
+        // `Effect::Quit` leads straight to `std::process::exit`, which does not
+        // unwind, run destructors, or wait on anything in flight. Writing here —
+        // synchronously, still inside this awaited loop iteration, before the
+        // Quit check ever runs — guarantees the state is on disk before that
+        // exit gets a chance to fire, no matter what order the effects vector
+        // lists them in.
+        if effects.contains(&Effect::Persist) {
+            let snapshot = PersistedState::from_selection(state.selection.as_ref(), state.last_sync);
+            if let Err(e) = save(&state_file, &snapshot) {
+                eprintln!("protector: failed to save state: {e:#}");
+            }
+        }
         if effects.contains(&Effect::Quit) {
             break;
         }
