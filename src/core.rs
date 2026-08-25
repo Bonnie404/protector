@@ -12,6 +12,12 @@ pub struct AppState {
     pub connected: bool,
     pub last_sync: Option<DateTime<Local>>,
     pub last_error: Option<String>,
+    /// A short, menu-safe reason for `last_error`, when the failure was
+    /// specific enough to produce one that fits the tray's width without
+    /// truncating a sentence mid-way — `None` for a generic failure (a
+    /// network hiccup, a timeout), where the full detail belongs in the log
+    /// alone. Set alongside `last_error` by [`crate::sync::apply_sync`].
+    pub last_error_hint: Option<String>,
     pub revision: u32,
     /// Whether `tasks_now`/`tasks_later` are what a sync actually returned.
     ///
@@ -47,6 +53,7 @@ impl Default for AppState {
             connected: false,
             last_sync: None,
             last_error: None,
+            last_error_hint: None,
             revision: 0,
             synced: false,
             warn_before_secs: WARN_BEFORE_SECS,
@@ -168,8 +175,15 @@ pub fn derive_ui(state: &AppState, now: DateTime<Local>, task_ids: &mut TaskIdMe
             .last_sync
             .map(|t| t.format("%H:%M").to_string())
             .unwrap_or_else(|| "never".into());
-        items
-            .push(MenuItem::disabled(ids::OFFLINE, &format!("\u{26a0} Offline \u{2014} synced {synced}")));
+        // `last_error_hint` is only ever `Some` when it already fits the
+        // tray's width (see its doc comment) — appending it here never
+        // truncates. When there is nothing concise to say, the item stays
+        // exactly as it always has; the full detail is in the log either way.
+        let label = match &state.last_error_hint {
+            Some(hint) => format!("\u{26a0} Offline \u{2014} synced {synced} \u{2014} {hint}"),
+            None => format!("\u{26a0} Offline \u{2014} synced {synced}"),
+        };
+        items.push(MenuItem::disabled(ids::OFFLINE, &label));
     }
 
     items.push(MenuItem::separator(ids::COMMAND_SEPARATOR));
@@ -403,6 +417,7 @@ mod tests {
             connected: true,
             last_sync: Some(at(14, 3)),
             last_error: None,
+            last_error_hint: None,
             revision: 0,
             synced: true,
             warn_before_secs: WARN_BEFORE_SECS,

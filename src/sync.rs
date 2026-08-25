@@ -251,6 +251,41 @@ async fn save_refresh_token(
     Ok(())
 }
 
+/// What a failed sync reports to the run loop: the same text `run` already
+/// sent to the log (see there), plus a short reason safe to show in the tray
+/// menu when the failure was specific enough to produce one.
+///
+/// `hint` is deliberately `None` rather than a truncated `message` for
+/// anything that would not fit the tray's width — see [`menu_hint`].
+#[derive(Debug, Clone)]
+pub struct SyncFailure {
+    pub message: String,
+    pub hint: Option<String>,
+}
+
+impl SyncFailure {
+    fn from_error(e: &anyhow::Error) -> Self {
+        SyncFailure { message: format!("{e:#}"), hint: menu_hint(e) }
+    }
+}
+
+/// A short, menu-safe reason for `e`, or `None` when nothing concise is
+/// worth showing. Only the Calendar API's own error (`calendar::
+/// CalendarApiError`) is specific enough to draw one from: a generic network
+/// failure, timeout, or decode error has no structured content to summarise,
+/// so those show nothing extra in the menu and rely on the log entirely.
+fn menu_hint(e: &anyhow::Error) -> Option<String> {
+    let api_err = e.chain().find_map(|c| c.downcast_ref::<calendar::CalendarApiError>())?;
+    if api_err.is_access_not_configured() {
+        return Some("API not enabled".to_string());
+    }
+    // A message short enough to fit the narrow tray menu without truncating
+    // mid-sentence is safe to show as-is; anything longer stays log-only.
+    const MAX_CHARS: usize = 40;
+    let msg = api_err.message.as_deref()?;
+    (msg.chars().count() <= MAX_CHARS).then(|| msg.to_string())
+}
+
 /// Folds a sync outcome into the state, returning the effects it produced.
 ///
 /// A failure keeps every task exactly where it was and only raises
@@ -259,7 +294,7 @@ async fn save_refresh_token(
 /// throw away the one thing the user still needs.
 pub fn apply_sync(
     state: &mut AppState,
-    result: Result<Vec<Task>, String>,
+    result: Result<Vec<Task>, SyncFailure>,
     now: DateTime<Local>,
 ) -> Vec<Effect> {
     match result {
@@ -268,6 +303,7 @@ pub fn apply_sync(
             state.tasks_now = running;
             state.tasks_later = later;
             state.last_error = None;
+            state.last_error_hint = None;
             state.last_sync = Some(now);
             // The lists above are now an actual answer about today, which is
             // what lets the menu say `Nothing scheduled today` when they are
@@ -281,8 +317,9 @@ pub fn apply_sync(
                 reconcile(state, &tasks)
             }
         }
-        Err(message) => {
-            state.last_error = Some(message);
+        Err(failure) => {
+            state.last_error = Some(failure.message);
+            state.last_error_hint = failure.hint;
             state.revision += 1;
             vec![]
         }
@@ -379,11 +416,21 @@ async fn run(mut syncer: Syncer, mut requests: mpsc::Receiver<()>, tx: mpsc::Sen
             // says *that* something is wrong, and this is the only place that
             // says what. A laptop offline all day must not fill the journal.
             eprintln!("protector: sync failed: {e:#}");
+            // The single most common first-run failure gets a second,
+            // pointedly actionable line: the exact URL that fixes it, so it
+            // is not buried inside the sentence above.
+            if let Some(api_err) = e.chain().find_map(|c| c.downcast_ref::<calendar::CalendarApiError>()) {
+                if let Some(url) = api_err.enable_url() {
+                    eprintln!(
+                        "protector: Google Calendar API is not enabled for this project \u{2014} enable it, then retry: {url}"
+                    );
+                }
+            }
         }
         // `{:#}` so an `anyhow` chain arrives as one line. None of these errors
         // can carry a token: `auth` drops Google's error bodies precisely
         // because they quote the refresh token back at you.
-        if tx.send(Command::Synced(outcome.map_err(|e| format!("{e:#}")))).await.is_err() {
+        if tx.send(Command::Synced(outcome.map_err(|e| SyncFailure::from_error(&e)))).await.is_err() {
             return;
         }
     }
@@ -599,7 +646,7 @@ mod tests {
         let before = state.revision;
 
         let error = syncer(&server, store).sync(at(14, 30)).await.unwrap_err();
-        apply_sync(&mut state, Err(format!("{error:#}")), at(14, 30));
+        apply_sync(&mut state, Err(SyncFailure::from_error(&error)), at(14, 30));
 
         assert_eq!(state.tasks_now.len(), 1, "the last good list must survive");
         assert_eq!(state.tasks_later.len(), 1);
@@ -615,6 +662,54 @@ mod tests {
             .items
             .iter()
             .any(|i| i.label == "\u{26a0} Offline \u{2014} synced 14:03" && !i.enabled));
+    }
+
+    /// End-to-end through the real production types — `Syncer::sync`,
+    /// `calendar::CalendarApiError`, `SyncFailure::from_error`, `apply_sync`,
+    /// `derive_ui` — for the exact `accessNotConfigured` body Google returns
+    /// when the Calendar API is disabled on a project. Not just a unit check:
+    /// this is the concrete first-run failure the whole feature exists for.
+    #[tokio::test]
+    async fn an_access_not_configured_failure_shows_a_short_hint_in_the_offline_menu() {
+        let server = MockServer::start().await;
+        let (_dir, store) = store(Some("1//stored"));
+        mock_token(
+            &server,
+            serde_json::json!({"access_token": "ya29.first", "expires_in": 3599}),
+        )
+        .await;
+        mock_events(
+            &server,
+            "ya29.first",
+            ResponseTemplate::new(403).set_body_json(serde_json::json!({
+                "error": {
+                    "code": 403,
+                    "message": "Google Calendar API has not been used in project 209385970212 before or it is disabled. Enable it by visiting https://console.developers.google.com/apis/api/calendar-json.googleapis.com/overview?project=209385970212 then retry.",
+                    "errors": [{"domain": "usageLimits", "reason": "accessNotConfigured"}],
+                    "status": "PERMISSION_DENIED"
+                }
+            })),
+        )
+        .await;
+
+        let error = syncer(&server, store).sync(at(14, 30)).await.unwrap_err();
+        let failure = SyncFailure::from_error(&error);
+        assert!(
+            failure.message.contains("has not been used in project 209385970212"),
+            "the full message belongs in the log: {}",
+            failure.message
+        );
+        assert_eq!(failure.hint.as_deref(), Some("API not enabled"));
+
+        let mut state = connected_state();
+        apply_sync(&mut state, Err(failure), at(14, 30));
+
+        let ui = derive_ui(&state, at(14, 30), &mut TaskIdMemo::default());
+        let labels: Vec<&str> = ui.menu.items.iter().map(|i| i.label.as_str()).collect();
+        assert!(
+            labels.contains(&"\u{26a0} Offline \u{2014} synced never \u{2014} API not enabled"),
+            "{labels:?}"
+        );
     }
 
     #[test]

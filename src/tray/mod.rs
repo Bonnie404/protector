@@ -18,7 +18,7 @@ pub struct UiState {
 pub enum Command {
     Tick,
     /// A sync finished: today's tasks, or why the fetch failed.
-    Synced(Result<Vec<crate::task::Task>, String>),
+    Synced(Result<Vec<crate::task::Task>, crate::sync::SyncFailure>),
     /// A login started from the menu finished. The OAuth flow waits on a
     /// browser for up to five minutes, so it cannot run inside the run loop
     /// that also drives the 1 Hz label; it reports back through this instead.
