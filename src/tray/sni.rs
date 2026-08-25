@@ -33,15 +33,22 @@ impl StatusNotifierItem {
         }
     }
 
+    /// Branches on attention too, not just `attention_icon_name`: some SNI
+    /// hosts read only this property and never switch to the dedicated
+    /// attention icon on their own, so the overtime icon has to be reachable
+    /// through both paths.
     #[zbus(property)]
     async fn icon_name(&self) -> &str {
-        // A stock icon until Task 11 ships the real pair.
-        "alarm-symbolic"
+        if self.ui.borrow().attention {
+            "protector-attention"
+        } else {
+            "protector"
+        }
     }
 
     #[zbus(property)]
     async fn attention_icon_name(&self) -> &str {
-        "alarm-symbolic"
+        "protector-attention"
     }
 
     #[zbus(property)]

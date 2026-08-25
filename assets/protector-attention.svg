@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" width="16" height="16">
+  <!-- Same hourglass silhouette as protector.svg, but with an explicit red
+       fill rather than currentColor: this is the overtime icon, and its
+       colour must survive whatever the panel theme would otherwise tint a
+       symbolic icon with. -->
+  <path fill="#e01b24" d="M3,2 L13,2 L13,3 L8,8 L13,13 L13,14 L3,14 L3,13 L8,8 L3,3 Z"/>
+</svg>
