@@ -2,7 +2,6 @@ pub mod menu;
 pub mod menu_model;
 pub mod sni;
 
-use anyhow::Context;
 use futures_util::StreamExt;
 use menu_model::MenuModel;
 use tokio::sync::{mpsc, watch};
@@ -22,6 +21,18 @@ pub enum Command {
     AboutToShow,
     SecondaryActivate,
 }
+
+/// Protector claims two well-known names on one connection, and they are not
+/// interchangeable:
+///
+/// * `org.kde.StatusNotifierItem-<pid>-1` is the **tray identity**. The PID in it
+///   is the convention every SNI host expects, which is exactly why it can never
+///   collide between two instances and so can never act as a lock.
+/// * `org.protector.Instance` is the **single-instance lock**, and the only reason
+///   it is fixed. A second Protector fails to acquire it and exits (spec §9).
+///
+/// Removing either one breaks something that is not obvious from its call site.
+pub const INSTANCE_LOCK_NAME: &str = "org.protector.Instance";
 
 #[zbus::proxy(
     interface = "org.kde.StatusNotifierWatcher",
@@ -59,8 +70,14 @@ async fn run_tray_inner(
         None => zbus::connection::Builder::session()?,
     };
     let conn = builder
-        .name(well_known.as_str())
-        .context("another Protector instance already owns the tray name")?
+        // zbus defaults to AllowReplacement | ReplaceExisting | DoNotQueue. With
+        // ReplaceExisting a second instance would *steal* the lock instead of
+        // failing, and with AllowReplacement ours could be stolen in turn. Only
+        // DoNotQueue is wanted, so that a taken name is an error, not a queue slot.
+        .allow_name_replacements(false)
+        .replace_existing_names(false)
+        .name(well_known.as_str())?
+        .name(INSTANCE_LOCK_NAME)?
         .serve_at(
             "/StatusNotifierItem",
             sni::StatusNotifierItem {
@@ -75,8 +92,16 @@ async fn run_tray_inner(
                 tx: tx.clone(),
             },
         )?
+        // Both names are requested here, inside `build()` — `name()` above only
+        // validates their syntax, so this is the one place the lock can fail.
         .build()
-        .await?;
+        .await
+        .map_err(|e| match e {
+            zbus::Error::NameTaken => anyhow::anyhow!(
+                "another Protector instance is already running (it owns {INSTANCE_LOCK_NAME} on the session bus)"
+            ),
+            other => anyhow::Error::new(other),
+        })?;
 
     register_and_watch(conn.clone(), well_known);
     spawn_emitter(conn.clone(), ui);

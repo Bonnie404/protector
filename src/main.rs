@@ -24,7 +24,15 @@ async fn main() -> anyhow::Result<()> {
         menu: menu.clone(),
     });
     let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::channel(32);
-    let _conn = tray::run_tray(ui_rx, cmd_tx.clone()).await?;
+    // A refused single-instance lock is an expected outcome, not a crash: say so
+    // in one line on stderr and exit non-zero, with no `Error:` dump or backtrace.
+    let _conn = match tray::run_tray(ui_rx, cmd_tx.clone()).await {
+        Ok(conn) => conn,
+        Err(e) => {
+            eprintln!("protector: {e:#}");
+            std::process::exit(1);
+        }
+    };
 
     let end = Local::now() + chrono::Duration::minutes(3);
     tokio::spawn(async move {
