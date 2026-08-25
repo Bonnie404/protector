@@ -176,6 +176,21 @@ pub struct MenuItem {
     pub action: Action,
 }
 
+/// Flattens control characters out of a menu label.
+///
+/// Labels are single-line display strings, but their text comes from outside:
+/// an event title is whatever the calendar owner typed, and a sync failure can
+/// put a message from Google's API in front of the user. A newline or a stray
+/// control byte in either would render as a mangled row rather than being
+/// rejected, so they collapse to a space here — at the one point every label
+/// passes through on its way to the panel.
+fn sanitize_label(label: &str) -> String {
+    label
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect()
+}
+
 impl MenuItem {
     pub fn command(id: i32, label: &str, action: Action) -> Self {
         Self { id, label: label.into(), enabled: true, separator: false, radio: None, action }
@@ -197,7 +212,7 @@ impl MenuItem {
             return p;
         }
         // DBusMenu reads a single underscore as a mnemonic marker.
-        p.insert("label".into(), own(self.label.replace('_', "__")));
+        p.insert("label".into(), own(sanitize_label(&self.label).replace('_', "__")));
         p.insert("enabled".into(), own(self.enabled));
         p.insert("visible".into(), own(true));
         if let Some(checked) = self.radio {
@@ -281,6 +296,30 @@ mod tests {
         assert_eq!(layout.id, 0);
         assert_eq!(layout.properties.get("children-display").unwrap(), &own("submenu"));
         assert_eq!(layout.children.len(), 4);
+    }
+
+    #[test]
+    fn control_characters_in_a_title_cannot_mangle_a_menu_row() {
+        // An event title is whatever the calendar owner typed, and an offline
+        // hint can carry a message from Google's API. Neither is trusted to be
+        // one line.
+        let model = MenuModel::new(vec![MenuItem::command(
+            1,
+            "Stand-up\nsecond line\tand a tab",
+            Action::Refresh,
+        )]);
+        let props = model.group_properties(&[1]);
+        assert_eq!(
+            props[0].1.get("label").unwrap(),
+            &own("Stand-up second line and a tab")
+        );
+    }
+
+    #[test]
+    fn a_sanitised_label_is_still_mnemonic_escaped() {
+        let model = MenuModel::new(vec![MenuItem::command(1, "deep_work\nnow", Action::Refresh)]);
+        let props = model.group_properties(&[1]);
+        assert_eq!(props[0].1.get("label").unwrap(), &own("deep__work now"));
     }
 
     #[test]
