@@ -1,0 +1,15 @@
+{"items":[
+ {"id":"e1","status":"confirmed","summary":"Design review",
+  "start":{"dateTime":"2026-08-25T14:00:00+02:00"},"end":{"dateTime":"2026-08-25T15:30:00+02:00"}},
+ {"id":"e2","status":"confirmed","summary":"Deep work",
+  "start":{"dateTime":"2026-08-25T15:30:00+02:00"},"end":{"dateTime":"2026-08-25T17:00:00+02:00"}},
+ {"id":"e3","status":"confirmed","summary":"Public holiday",
+  "start":{"date":"2026-08-25"},"end":{"date":"2026-08-26"}},
+ {"id":"e4","status":"cancelled","summary":"Cancelled sync",
+  "start":{"dateTime":"2026-08-25T16:00:00+02:00"},"end":{"dateTime":"2026-08-25T16:30:00+02:00"}},
+ {"id":"e5","status":"confirmed","summary":"Someone else's meeting",
+  "start":{"dateTime":"2026-08-25T16:00:00+02:00"},"end":{"dateTime":"2026-08-25T16:30:00+02:00"},
+  "attendees":[{"self":true,"responseStatus":"declined"}]},
+ {"id":"e6","status":"confirmed",
+  "start":{"dateTime":"2026-08-25T18:00:00+02:00"},"end":{"dateTime":"2026-08-25T18:30:00+02:00"}}
+]}
