@@ -1,0 +1,3 @@
+mod task;
+
+fn main() {}
