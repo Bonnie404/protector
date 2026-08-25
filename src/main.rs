@@ -194,14 +194,11 @@ async fn status() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Asks the sync task for an out-of-band sync, if there is one.
-///
-/// Never blocks and never fails: the channel holds one slot, so a full channel
-/// already carries a request for exactly what this call wanted, and no sync
-/// task at all means no account to sync.
-fn request_sync(handle: &Option<mpsc::Sender<()>>) {
-    if let Some(tx) = handle {
-        let _ = tx.try_send(());
+/// Asks the sync task for an out-of-band sync, if there is one. Never blocks,
+/// and no sync task at all means no account to sync.
+fn request_sync(handle: &Option<sync::SyncHandle>) {
+    if let Some(handle) = handle {
+        handle.request();
     }
 }
 
@@ -245,15 +242,53 @@ fn start_login(cfg: &config::Config, tx: mpsc::Sender<Command>) -> bool {
     }
     let cfg = cfg.clone();
     tokio::spawn(async move {
+        let report = LoginReport::new(tx);
         let outcome = connect_account(&cfg).await.map(|(where_, stale)| {
             println!("protector: connected. The refresh token is kept in the {where_}.");
             for other in stale {
                 eprintln!("protector: warning — could not clear an older token from the {other}.");
             }
         });
-        let _ = tx.send(Command::LoggedIn(outcome.map_err(|e| format!("{e:#}")))).await;
+        report.send(outcome.map_err(|e| format!("{e:#}"))).await;
     });
     true
+}
+
+/// Guarantees the run loop hears about a login exactly once.
+///
+/// The `login_in_flight` latch is only ever cleared by a `Command::LoggedIn`,
+/// so a flow that ended without sending one — a panic anywhere in the OAuth
+/// path, a cancelled task — would leave *Connect Google Calendar…* inert for
+/// the rest of the process, with the widget insisting a browser it no longer
+/// waits for is still being waited on.
+struct LoginReport {
+    tx: mpsc::Sender<Command>,
+    sent: bool,
+}
+
+impl LoginReport {
+    fn new(tx: mpsc::Sender<Command>) -> Self {
+        Self { tx, sent: false }
+    }
+
+    /// The ordinary path: awaited, so a busy run loop cannot lose it.
+    async fn send(mut self, outcome: Result<(), String>) {
+        self.sent = true;
+        let _ = self.tx.send(Command::LoggedIn(outcome)).await;
+    }
+}
+
+impl Drop for LoginReport {
+    fn drop(&mut self) {
+        if !self.sent {
+            // Unwinding, so this cannot await. `try_send` is the best available
+            // and is near-certain to succeed: the run loop drains a 32-slot
+            // channel once per tick.
+            let _ = self
+                .tx
+                .try_send(Command::LoggedIn(Err("the connection attempt ended unexpectedly".into())));
+        }
+    }
 }
 
 /// Clears every store rather than the selected one, for the same reason
@@ -327,11 +362,11 @@ async fn run() -> anyhow::Result<()> {
     // The sync task exists only while an account is connected. Without one
     // there is nothing to fetch, and a timer failing every five minutes would
     // only hang a `⚠ Offline` item under `Not connected`.
-    let mut sync_tx = state.connected.then(|| {
+    let mut sync = state.connected.then(|| {
         sync::spawn(sync::Syncer::new(cfg.clone(), store.clone()), cmd_tx.clone())
     });
     // Today's list, now, rather than in five minutes' time.
-    request_sync(&sync_tx);
+    request_sync(&sync);
     // Nothing on screen moves while a login waits on the browser, so a second
     // click on *Connect* is the natural thing for a user to do. Without this it
     // would open a second consent tab on a second loopback port.
@@ -350,13 +385,13 @@ async fn run() -> anyhow::Result<()> {
             // someone flicking the menu open and shut.
             Command::AboutToShow => {
                 if sync::is_stale(state.last_sync, now) {
-                    request_sync(&sync_tx);
+                    request_sync(&sync);
                 }
                 vec![]
             }
             // Middle-click: the user asking outright.
             Command::SecondaryActivate => {
-                request_sync(&sync_tx);
+                request_sync(&sync);
                 vec![]
             }
             // A sync still in flight when the account was disconnected must not
@@ -368,13 +403,15 @@ async fn run() -> anyhow::Result<()> {
                 state.connected = true;
                 state.last_error = None;
                 state.revision += 1;
-                // Replacing the handle drops the previous sender, which ends
-                // any sync task left over from an earlier connection.
-                sync_tx = Some(sync::spawn(
+                // Aborted before the new one starts: an attempt left running
+                // from an earlier connection would otherwise deliver one more
+                // `Synced`, which `connected == true` now admits.
+                drop(sync.take());
+                sync = Some(sync::spawn(
                     sync::Syncer::new(cfg.clone(), store.clone()),
                     cmd_tx.clone(),
                 ));
-                request_sync(&sync_tx);
+                request_sync(&sync);
                 vec![]
             }
             Command::LoggedIn(Err(e)) => {
@@ -401,15 +438,18 @@ async fn run() -> anyhow::Result<()> {
         }
         for effect in &effects {
             match effect {
-                Effect::Sync => request_sync(&sync_tx),
+                Effect::Sync => request_sync(&sync),
                 Effect::StartLogin if login_in_flight => {
                     eprintln!("protector: a connection attempt is already waiting for the browser.");
                 }
                 Effect::StartLogin => login_in_flight = start_login(&cfg, cmd_tx.clone()),
                 Effect::Logout => {
-                    // Dropping the handle ends the sync task; the account it
-                    // was syncing is about to stop existing.
-                    sync_tx = None;
+                    // Aborted *before* the stores are cleared, and not merely
+                    // asked to stop: an attempt already inside a 401 retry
+                    // could otherwise persist a rotated refresh token after
+                    // the clear had run, leaving a live credential behind an
+                    // explicit disconnect.
+                    drop(sync.take());
                     forget_account();
                 }
                 _ => {}
@@ -434,4 +474,29 @@ async fn run() -> anyhow::Result<()> {
     // waiting out the background loops' retry timers.
     let _ = conn.close().await;
     std::process::exit(0);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A login task that dies without reporting must not strand the latch.
+    #[tokio::test]
+    async fn a_login_that_never_reports_still_frees_the_menu_item() {
+        let (tx, mut rx) = mpsc::channel(4);
+        drop(LoginReport::new(tx));
+        match rx.try_recv() {
+            Ok(Command::LoggedIn(Err(e))) => assert!(e.contains("unexpectedly"), "{e}"),
+            other => panic!("expected a LoggedIn failure, got {other:?}"),
+        }
+    }
+
+    /// And a login that does report sends exactly that, once.
+    #[tokio::test]
+    async fn a_login_that_reports_sends_its_own_outcome_only() {
+        let (tx, mut rx) = mpsc::channel(4);
+        LoginReport::new(tx).send(Ok(())).await;
+        assert!(matches!(rx.try_recv(), Ok(Command::LoggedIn(Ok(())))));
+        assert!(rx.try_recv().is_err(), "the drop guard must not send a second time");
+    }
 }

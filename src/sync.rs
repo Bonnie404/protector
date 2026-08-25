@@ -264,15 +264,40 @@ fn out_of_window(state: &AppState, fresh: &[Task], now: DateTime<Local>) -> bool
         .is_some_and(|s| s.task.end <= now && !fresh.iter().any(|t| t.id == s.task.id))
 }
 
-/// Starts the sync task and hands back the handle that asks it for an
-/// out-of-band sync. Dropping the handle stops the task.
-pub fn spawn(syncer: Syncer, tx: mpsc::Sender<Command>) -> mpsc::Sender<()> {
+/// A running sync task.
+///
+/// Dropping this stops the task **now**, not at the end of whatever it is
+/// doing. Closing the request channel alone would only end the loop between
+/// attempts, and an attempt can be up to `REQUEST_TIMEOUT` long — long enough
+/// for a 401 retry to rotate the refresh token and write it to the store
+/// *after* a "Disconnect account" has already cleared it, leaving a live
+/// credential behind an explicit revocation. The abort closes that window.
+pub struct SyncHandle {
+    requests: mpsc::Sender<()>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl SyncHandle {
+    /// Asks for an out-of-band sync. Never blocks: the channel holds one slot,
+    /// so a full channel already carries a request for exactly this.
+    pub fn request(&self) {
+        let _ = self.requests.try_send(());
+    }
+}
+
+impl Drop for SyncHandle {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// Starts the sync task. The task lives exactly as long as the handle.
+pub fn spawn(syncer: Syncer, tx: mpsc::Sender<Command>) -> SyncHandle {
     // Capacity 1: a second request arriving while one is already queued asks
     // for the same thing, so `try_send` drops it rather than making the run
     // loop — which is also the 1 Hz tick loop — wait for room.
-    let (requests_tx, requests_rx) = mpsc::channel(1);
-    tokio::spawn(run(syncer, requests_rx, tx));
-    requests_tx
+    let (requests, requests_rx) = mpsc::channel(1);
+    SyncHandle { requests, task: tokio::spawn(run(syncer, requests_rx, tx)) }
 }
 
 /// Syncs on request and on a timer, reporting every outcome back to the run
@@ -579,6 +604,58 @@ mod tests {
             expires_at: at(14, 29),
         });
         s.sync(at(14, 30)).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_logout_stops_an_attempt_that_would_have_rotated_the_token_afterwards() {
+        // The race this pins: a 401 sends the syncer to the token endpoint,
+        // Google answers slowly with a *rotated* refresh token, and by the time
+        // it lands the user has already chosen "Disconnect account". Writing it
+        // then would leave a live credential behind an explicit revocation.
+        let server = MockServer::start().await;
+        let (_dir, store) = store(Some("1//stored"));
+        mock_events(&server, "ya29.stale", ResponseTemplate::new(401)).await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({
+                        "access_token": "ya29.fresh",
+                        "refresh_token": "1//rotated",
+                        "expires_in": 3599,
+                    }))
+                    .set_delay(Duration::from_millis(300)),
+            )
+            .mount(&server)
+            .await;
+
+        let mut s = syncer(&server, store.clone());
+        s.tokens = Some(Tokens {
+            access_token: "ya29.stale".into(),
+            refresh_token: Some("1//stored".into()),
+            // The loop syncs at `Local::now()`, not at a fixture instant, so
+            // this has to be unexpired against the wall clock — otherwise the
+            // attempt refreshes up front and never reaches the 401 path.
+            expires_at: Local::now() + chrono::Duration::hours(1),
+        });
+        let (cmd_tx, _cmd_rx) = mpsc::channel(4);
+        let handle = spawn(s, cmd_tx);
+        handle.request();
+        // Long enough to be inside the delayed token exchange, far short of the
+        // response landing.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Exactly what `Effect::Logout` does, in that order.
+        drop(handle);
+        store.clear().unwrap();
+
+        // Well past the point the rotated token would have been written.
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        assert_eq!(
+            store.load().unwrap(),
+            None,
+            "a rotated refresh token was written after the account was disconnected"
+        );
     }
 
     // ---- Reconciliation through a real sync ---------------------------------
