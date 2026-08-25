@@ -180,19 +180,46 @@ pub async fn notify_simple(conn: &Connection, summary: &str, body: &str) -> zbus
     proxy.notify("Protector", 0, "alarm-symbolic", summary, body, &[], HashMap::new(), -1).await
 }
 
+/// A live subscription to `ActionInvoked`.
+///
+/// Its existence is the guarantee: [`subscribe_actions`] does not return until
+/// the bus has acknowledged the `AddMatch` behind it, so any signal emitted
+/// after that point is delivered to this stream — buffered if nothing is
+/// reading yet. Signals emitted *before* it are lost, which is why the
+/// subscription is a separate, awaitable step rather than the first line of a
+/// spawned loop.
+pub struct ActionSubscription {
+    stream: ActionInvokedStream,
+}
+
+impl ActionSubscription {
+    /// Turns pressed notification buttons into selection commands, for as long
+    /// as the connection lives.
+    pub async fn forward(mut self, tx: mpsc::Sender<Command>) -> zbus::Result<()> {
+        use futures_util::StreamExt;
+        while let Some(signal) = self.stream.next().await {
+            let args = signal.args()?;
+            if let Some(id) = action_to_event_id(&args.action_key) {
+                let _ = tx.send(Command::SelectById(id)).await;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Subscribes to `ActionInvoked`. The subscription is established by the time
+/// this resolves; see [`ActionSubscription`].
+pub async fn subscribe_actions(conn: &Connection) -> zbus::Result<ActionSubscription> {
+    let proxy = NotificationsProxy::new(conn).await?;
+    // The stream owns its match rule and its share of the connection, so
+    // dropping the proxy here does not unsubscribe it.
+    Ok(ActionSubscription { stream: proxy.receive_action_invoked().await? })
+}
+
 /// Turns a pressed notification button into a selection command. Runs for as
 /// long as the connection lives; the caller spawns it once at startup.
 pub async fn watch_actions(conn: Connection, tx: mpsc::Sender<Command>) -> zbus::Result<()> {
-    use futures_util::StreamExt;
-    let proxy = NotificationsProxy::new(&conn).await?;
-    let mut stream = proxy.receive_action_invoked().await?;
-    while let Some(signal) = stream.next().await {
-        let args = signal.args()?;
-        if let Some(id) = action_to_event_id(&args.action_key) {
-            let _ = tx.send(Command::SelectById(id)).await;
-        }
-    }
-    Ok(())
+    subscribe_actions(&conn).await?.forward(tx).await
 }
 
 #[cfg(test)]

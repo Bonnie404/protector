@@ -10,12 +10,18 @@ use protector::tray::UiState;
 
 struct FakeWatcher {
     registered: Arc<Mutex<Vec<String>>>,
+    /// Announces each registration as it lands, so a test can wait for the
+    /// event itself instead of guessing how long it takes to arrive.
+    announce: tokio::sync::mpsc::Sender<String>,
 }
 
 #[zbus::interface(name = "org.kde.StatusNotifierWatcher")]
 impl FakeWatcher {
     async fn register_status_notifier_item(&self, service: String) {
-        self.registered.lock().unwrap().push(service);
+        self.registered.lock().unwrap().push(service.clone());
+        // `try_send`, never `send`: a D-Bus method handler must not park on a
+        // test that has stopped listening.
+        let _ = self.announce.try_send(service);
     }
 
     #[zbus(property)]
@@ -90,6 +96,7 @@ async fn item_registers_itself_and_serves_the_label() {
     let address = bus.address.clone();
 
     let registered = Arc::new(Mutex::new(Vec::new()));
+    let (announce, mut registrations) = tokio::sync::mpsc::channel(4);
     let _watcher = zbus::connection::Builder::address(address.as_str())
         .unwrap()
         .name("org.kde.StatusNotifierWatcher")
@@ -98,6 +105,7 @@ async fn item_registers_itself_and_serves_the_label() {
             "/StatusNotifierWatcher",
             FakeWatcher {
                 registered: registered.clone(),
+                announce,
             },
         )
         .unwrap()
@@ -116,9 +124,19 @@ async fn item_registers_itself_and_serves_the_label() {
         .await
         .unwrap();
 
-    // The watcher was told about us.
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // The watcher was told about us. Waited for as the event it is — the same
+    // bounded shape as `next_signal` — rather than slept through: a fixed
+    // delay is both slower than the handshake in the common case and shorter
+    // than it under load.
+    let service = tokio::time::timeout(Duration::from_secs(5), registrations.recv())
+        .await
+        .expect("the item must register itself with the watcher")
+        .expect("the watcher outlives this wait");
     assert_eq!(registered.lock().unwrap().len(), 1);
+    assert!(
+        service.starts_with("org.kde.StatusNotifierItem-"),
+        "registered under an unexpected name: {service}"
+    );
 
     // And the label property serves what the UiState says. Property caching is
     // off so every read is a real `Properties.Get`, which is how the panel host

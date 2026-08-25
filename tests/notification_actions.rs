@@ -113,6 +113,25 @@ async fn fake_server(bus: &PrivateBus) -> (zbus::Connection, zbus::Connection, A
     (server, client, calls)
 }
 
+/// Starts the `ActionInvoked` listener and hands back the commands it
+/// forwards.
+///
+/// The subscription is awaited here, in the test's own task, rather than
+/// happening somewhere inside a spawned one: `notify::subscribe_actions` does
+/// not resolve until the bus has acknowledged the `AddMatch`, so every signal
+/// emitted after this call is guaranteed to reach the listener. That
+/// guarantee is what a fixed 300 ms sleep used to approximate — and a signal
+/// emitted before a subscription is simply dropped, which would have made the
+/// assertions below pass without testing anything.
+async fn listening(client: &zbus::Connection) -> tokio::sync::mpsc::Receiver<Command> {
+    let (tx, rx) = tokio::sync::mpsc::channel(4);
+    let actions = notify::subscribe_actions(client).await.expect("subscribing to ActionInvoked");
+    tokio::spawn(async move {
+        let _ = actions.forward(tx).await;
+    });
+    rx
+}
+
 fn urgency_of(call: &Recorded) -> u8 {
     call.hints
         .get("urgency")
@@ -266,15 +285,7 @@ async fn pressing_an_action_button_selects_that_task() {
     let bus = private_bus();
     let (server, client, _calls) = fake_server(&bus).await;
 
-    let (tx, mut rx) = tokio::sync::mpsc::channel(4);
-    let watcher_conn = client.clone();
-    tokio::spawn(async move {
-        let _ = notify::watch_actions(watcher_conn, tx).await;
-    });
-    // No signal-subscription handshake is exposed to wait on directly, so a
-    // short grace period stands in for it — generous relative to how fast a
-    // local D-Bus subscribe actually completes.
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    let mut rx = listening(&client).await;
 
     let iface_ref = server
         .object_server()
@@ -300,12 +311,7 @@ async fn pressing_nothing_dismisses_without_selecting_anything() {
     let bus = private_bus();
     let (server, client, _calls) = fake_server(&bus).await;
 
-    let (tx, mut rx) = tokio::sync::mpsc::channel(4);
-    let watcher_conn = client.clone();
-    tokio::spawn(async move {
-        let _ = notify::watch_actions(watcher_conn, tx).await;
-    });
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    let mut rx = listening(&client).await;
 
     let iface_ref = server
         .object_server()
@@ -316,12 +322,10 @@ async fn pressing_nothing_dismisses_without_selecting_anything() {
     FakeNotifications::action_invoked(iface_ref.signal_emitter(), 1, "none".into())
         .await
         .unwrap();
-    assert!(
-        tokio::time::timeout(Duration::from_millis(300), rx.recv()).await.is_err(),
-        "the Nothing action must not produce a selection"
-    );
-
-    // The listener is still alive and correctly wired for a real button.
+    // Emitted second, from the same connection, so the bus delivers it second:
+    // anything `none` had produced would be queued ahead of it. Waiting for a
+    // command that *must* arrive proves the dismissal produced none, and does
+    // it without betting on how long "nothing happened" takes to observe.
     FakeNotifications::action_invoked(iface_ref.signal_emitter(), 2, "task:e5".into())
         .await
         .unwrap();
@@ -329,5 +333,8 @@ async fn pressing_nothing_dismisses_without_selecting_anything() {
         .await
         .expect("the listener must still be running after an ignored dismissal")
         .expect("the channel must still be open");
-    assert!(matches!(cmd, Command::SelectById(id) if id == "e5"));
+    assert!(
+        matches!(&cmd, Command::SelectById(id) if id == "e5"),
+        "the Nothing action must not produce a selection, but {cmd:?} arrived before e5"
+    );
 }
