@@ -89,44 +89,78 @@ pub fn task_slot(event_id: &str) -> i32 {
     (ids::FIRST_TASK as u64 + fnv1a64(event_id.as_bytes()) % span) as i32
 }
 
-/// Hands out one id per task item while a menu is being built.
+/// Remembers which menu id each event was given, for the life of the process.
 ///
-/// The point of deriving an id from the event rather than from the item's
-/// position is that a menu rebuild — which happens on every sync, and
-/// `AboutToShow` fires a sync at exactly the moment a menu opens — must not
-/// change what an id means. A host that clicks against a layout it fetched
-/// before the rebuild then still selects the block whose label it was
-/// showing.
+/// The guarantee it exists to provide, in one sentence: **an id, once handed
+/// to an event, is never handed to a different event.** A DBusMenu `Event`
+/// carries no revision, so a host can click an id against a layout it fetched
+/// arbitrarily long ago — and `AboutToShow` fires a sync at exactly the moment
+/// a menu opens, so a rebuild mid-open is likely rather than exotic. An id
+/// that could change hands is a click that selects the wrong block.
+///
+/// **It must outlive a single menu**, which is why this is threaded through
+/// `derive_ui` rather than created inside it. `main` owns one for the run
+/// loop. A fresh one per derivation would give the ordinary event its slot
+/// back every time — that much is stable on its own — but would reopen the
+/// collision case below.
 ///
 /// **Collisions are probed, not assumed away.** Two event ids can hash to one
-/// slot, and two menu items may not share an id: the second one would be
-/// unreachable and `action_for` would answer clicks on it with the first one's
-/// task, which is exactly the wrong-block selection this whole scheme exists
+/// slot, and two menu items may not share an id: the second would be
+/// unreachable and `action_for` would answer clicks on it with the first
+/// one's task, which is exactly the wrong-block selection this scheme exists
 /// to prevent. So the loser of a collision takes the next free id above its
-/// slot. That makes the *pair* order-dependent — drop the winner from
-/// tomorrow's list and the loser moves down to its own slot — which is a far
-/// smaller exposure than position-derived ids: it needs a hash collision
-/// between two blocks on the same day (roughly 1 in 2^31 per pair) before it
-/// costs anything at all, and even then the stale id usually resolves to
-/// nothing and is dropped.
+/// slot.
+///
+/// Probing is what makes the memo load-bearing rather than an optimisation.
+/// Without it: A and B collide on slot S, A wins S and B is probed to S+1,
+/// the host renders A at S; a sync drops A; a freshly built assignment would
+/// hand S to B, and a stale click on the row labelled A would select B. With
+/// the memo, S stays A's for good — the click finds nothing and is dropped —
+/// and B keeps S+1 whether or not A is still listed.
+///
+/// Growth is one entry per distinct event id ever shown, and `calendar::fetch`
+/// asks for one day at a time with `maxResults=50`, so it is bounded by
+/// 50 a day: a few hundred entries a week, a few hundred kilobytes a year.
+/// Nothing is evicted, deliberately — freeing an id is precisely how it would
+/// come to mean two different blocks, which is the bug this closes.
 #[derive(Debug, Default)]
-pub struct TaskIds {
+pub struct TaskIdMemo {
+    /// Every id ever handed out, including those whose event has since
+    /// vanished from the calendar. Probing skips these, so a departed block's
+    /// id is never reissued.
     taken: std::collections::HashSet<i32>,
+    assigned: std::collections::HashMap<String, i32>,
 }
 
-impl TaskIds {
-    /// The id for `event_id` in the menu being built. Calling it twice with
-    /// the same event in one menu yields two different ids — the same
-    /// treatment any other collision gets — rather than a duplicate.
+impl TaskIdMemo {
+    /// The id for `event_id`: the one it was given before, or a newly
+    /// reserved one.
+    ///
+    /// Asked twice for the same event — which `calendar::partition` cannot
+    /// produce, since Now and Later are disjoint — it answers with the same id
+    /// both times rather than reserving a second one.
     pub fn id_for(&mut self, event_id: &str) -> i32 {
+        if let Some(id) = self.assigned.get(event_id) {
+            return *id;
+        }
         let mut id = task_slot(event_id);
         while !self.taken.insert(id) {
             // Wraps within the task range, so probing can never walk into the
-            // fixed ids or onto the root. Terminates because a day's menu
-            // holds a few dozen items and the range holds two billion.
+            // fixed ids or onto the root. Terminates because the ids handed
+            // out are counted in hundreds and the range holds two billion.
             id = if id == i32::MAX { ids::FIRST_TASK } else { id + 1 };
         }
+        self.assigned.insert(event_id.to_string(), id);
         id
+    }
+
+    /// How many events have been given an id. Only the growth test uses this.
+    pub fn len(&self) -> usize {
+        self.assigned.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.assigned.is_empty()
     }
 }
 
@@ -293,7 +327,7 @@ mod tests {
         assert_ne!(task_slot("e1"), task_slot("e2"));
         // And a `TaskIds` that has not seen the event before hands out exactly
         // that slot, whatever order the menu happens to list things in.
-        assert_eq!(TaskIds::default().id_for("e2"), task_slot("e2"));
+        assert_eq!(TaskIdMemo::default().id_for("e2"), task_slot("e2"));
     }
 
     #[test]
@@ -329,7 +363,7 @@ mod tests {
             "these two event ids no longer collide — find another pair"
         );
 
-        let mut ids = TaskIds::default();
+        let mut ids = TaskIdMemo::default();
         let first = ids.id_for("e39516");
         let second = ids.id_for("e64020");
         assert_ne!(first, second, "two menu items may never share an id");
@@ -341,10 +375,48 @@ mod tests {
     }
 
     #[test]
+    fn the_memo_keeps_an_id_reserved_for_its_event_even_after_the_event_is_gone() {
+        // The residual a per-menu assignment left open. A and B collide: A
+        // takes the slot, B is probed one above, and the host is showing A at
+        // that slot. A is then deleted from the calendar, so every later menu
+        // asks only about B — and a freshly built assignment would give B the
+        // slot the host still labels A.
+        let mut memo = TaskIdMemo::default();
+        let winner = memo.id_for("e39516");
+        let loser = memo.id_for("e64020");
+        assert_eq!(loser, winner + 1);
+
+        for _ in 0..5 {
+            assert_eq!(
+                memo.id_for("e64020"),
+                loser,
+                "the survivor drifted onto the departed block's id"
+            );
+        }
+        // And a block that comes back — a deletion undone, a recurring event
+        // re-entering the day's window — is itself again, not somebody else.
+        assert_eq!(memo.id_for("e39516"), winner);
+    }
+
+    #[test]
+    fn the_memo_grows_by_one_per_distinct_event_not_per_menu() {
+        // It is never evicted, so what it costs is worth pinning: an entry per
+        // event ever shown, and nothing at all for redrawing the same menu —
+        // which happens once a second.
+        let mut memo = TaskIdMemo::default();
+        assert!(memo.is_empty());
+        for _ in 0..100 {
+            memo.id_for("e1");
+            memo.id_for("e2");
+        }
+        assert_eq!(memo.len(), 2, "a redraw must not cost an entry");
+    }
+
+    #[test]
     fn a_colliding_pair_stays_separately_clickable() {
         // The failure this prevents: one id in the menu, two blocks behind it,
         // and every click on either selecting whichever was listed first.
-        let mut ids = TaskIds::default();
+        let mut ids = TaskIdMemo::default();
         let a = ids.id_for("e39516");
         let b = ids.id_for("e64020");
         let model = MenuModel::new(vec![

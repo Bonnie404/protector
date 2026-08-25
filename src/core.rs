@@ -1,7 +1,7 @@
 use chrono::{DateTime, Local};
 
 use crate::task::{panel_label, Selection, Task};
-use crate::tray::menu_model::{ids, Action, MenuItem, MenuModel, TaskIds};
+use crate::tray::menu_model::{ids, Action, MenuItem, MenuModel, TaskIdMemo};
 use crate::tray::UiState;
 
 #[derive(Debug, Clone)]
@@ -108,7 +108,7 @@ fn item_label(t: &Task) -> String {
 
 fn push_tasks(
     items: &mut Vec<MenuItem>,
-    task_ids: &mut TaskIds,
+    task_ids: &mut TaskIdMemo,
     tasks: &[Task],
     selected_id: Option<&str>,
 ) {
@@ -119,17 +119,25 @@ fn push_tasks(
     }
 }
 
-/// Turns the current `AppState` into what the panel should show. Pure: same
-/// inputs always produce the same `UiState`, so callers can derive as often as
-/// they like without side effects.
+/// Turns the current `AppState` into what the panel should show. Deterministic:
+/// the same state and instant always produce the same `UiState`, so callers can
+/// derive as often as they like. The only thing it writes is the id memo below,
+/// and only to reserve an id for an event it has not seen before.
 ///
 /// Every id here is derived from *what the item is* — a constant for the fixed
 /// items, a hash of the event id for the tasks — and never from its position
-/// in the list. See [`TaskIds`] for why: a DBusMenu `Event` carries no
+/// in the list. See [`TaskIdMemo`] for why: a DBusMenu `Event` carries no
 /// revision, so an id has to survive a rebuild with its meaning intact.
-pub fn derive_ui(state: &AppState, now: DateTime<Local>) -> UiState {
+///
+/// `task_ids` is the one thing here that is not derived afresh, and it is an
+/// argument rather than a local for exactly that reason: it has to outlive the
+/// menu it is building, or a departed block's id could be reissued to another
+/// block. Passing the same memo on every call is what makes the ids mean one
+/// thing for the life of the process; `main` holds it beside the menu it last
+/// published. Deriving the same state twice with the same memo still yields
+/// the same `UiState`, so this stays as replayable as it was.
+pub fn derive_ui(state: &AppState, now: DateTime<Local>, task_ids: &mut TaskIdMemo) -> UiState {
     let mut items = Vec::new();
-    let mut task_ids = TaskIds::default();
     let selected_id = state.selection.as_ref().map(|s| s.task.id.as_str());
 
     if state.connected {
@@ -142,13 +150,13 @@ pub fn derive_ui(state: &AppState, now: DateTime<Local>) -> UiState {
                 if state.synced { "Nothing scheduled today" } else { "Loading today\u{2026}" };
             items.push(MenuItem::disabled(ids::EMPTY_DAY, empty));
         } else {
-            push_tasks(&mut items, &mut task_ids, &state.tasks_now, selected_id);
+            push_tasks(&mut items, task_ids, &state.tasks_now, selected_id);
             if !state.tasks_later.is_empty() {
                 if !state.tasks_now.is_empty() {
                     items.push(MenuItem::separator(ids::LIST_SEPARATOR));
                 }
                 items.push(MenuItem::disabled(ids::LATER_HEADER, "Later today"));
-                push_tasks(&mut items, &mut task_ids, &state.tasks_later, selected_id);
+                push_tasks(&mut items, task_ids, &state.tasks_later, selected_id);
             }
         }
     } else {
@@ -379,6 +387,14 @@ mod tests {
         Task { id: id.into(), title: title.into(), start: at(s.0, s.1), end: at(e.0, e.1) }
     }
 
+    /// `derive_ui` with a memo of its own. Used by every test that is about
+    /// labels, the panel text or effects rather than about ids; the id tests
+    /// below keep a memo across calls on purpose, which is the whole point of
+    /// it.
+    fn ui(state: &AppState, now: DateTime<Local>) -> UiState {
+        derive_ui(state, now, &mut TaskIdMemo::default())
+    }
+
     fn connected_state() -> AppState {
         AppState {
             tasks_now: vec![task("e1", "Design review", (14, 0), (15, 30))],
@@ -395,7 +411,7 @@ mod tests {
 
     #[test]
     fn menu_lists_now_then_later_with_a_header() {
-        let ui = derive_ui(&connected_state(), at(14, 6));
+        let ui = ui(&connected_state(), at(14, 6));
         let labels: Vec<&str> = ui.menu.items.iter().map(|i| i.label.as_str()).collect();
         assert!(labels[0].starts_with("Design review"));
         assert!(labels.contains(&"Later today"));
@@ -409,7 +425,7 @@ mod tests {
         let mut state = connected_state();
         apply(&mut state, &Action::SelectTask("e1".into()));
         assert_eq!(state.selection.as_ref().unwrap().task.id, "e1");
-        let ui = derive_ui(&state, at(14, 6));
+        let ui = ui(&state, at(14, 6));
         assert_eq!(ui.label, "1:24:00 \u{b7} Design review");
         assert_eq!(ui.menu.items[0].radio, Some(true));
     }
@@ -420,14 +436,14 @@ mod tests {
         apply(&mut state, &Action::SelectTask("e1".into()));
         apply(&mut state, &Action::SelectTask("e1".into()));
         assert!(state.selection.is_none());
-        assert_eq!(derive_ui(&state, at(14, 6)).label, "Pick a task");
+        assert_eq!(ui(&state, at(14, 6)).label, "Pick a task");
     }
 
     #[test]
     fn past_the_end_the_item_asks_for_attention() {
         let mut state = connected_state();
         apply(&mut state, &Action::SelectTask("e1".into()));
-        let ui = derive_ui(&state, at(15, 34));
+        let ui = ui(&state, at(15, 34));
         assert!(ui.attention);
         assert_eq!(ui.label, "\u{26a0} +04:00 \u{b7} Design review");
     }
@@ -437,7 +453,7 @@ mod tests {
         let mut state = connected_state();
         state.tasks_now.clear();
         state.tasks_later.clear();
-        let ui = derive_ui(&state, at(14, 6));
+        let ui = ui(&state, at(14, 6));
         assert!(ui.menu.items.iter().any(|i| i.label == "Nothing scheduled today" && !i.enabled));
     }
 
@@ -446,7 +462,7 @@ mod tests {
         // A first run with no network: the lists are empty because nothing
         // has filled them, not because the calendar is.
         let state = AppState { connected: true, last_error: Some("timeout".into()), ..Default::default() };
-        let ui = derive_ui(&state, at(14, 6));
+        let ui = ui(&state, at(14, 6));
         let labels: Vec<&str> = ui.menu.items.iter().map(|i| i.label.as_str()).collect();
         assert!(
             !labels.contains(&"Nothing scheduled today"),
@@ -462,7 +478,7 @@ mod tests {
         // say *when* — which must not be mistaken for having fetched today.
         let state = AppState { connected: true, last_sync: Some(at(9, 0)), ..Default::default() };
         let labels: Vec<String> =
-            derive_ui(&state, at(14, 6)).menu.items.iter().map(|i| i.label.clone()).collect();
+            ui(&state, at(14, 6)).menu.items.iter().map(|i| i.label.clone()).collect();
         assert!(!labels.iter().any(|l| l == "Nothing scheduled today"), "{labels:?}");
     }
 
@@ -472,7 +488,7 @@ mod tests {
         state.tasks_now.clear();
         state.tasks_later.clear();
         assert!(state.synced);
-        let ui = derive_ui(&state, at(14, 6));
+        let ui = ui(&state, at(14, 6));
         assert!(ui.menu.items.iter().any(|i| i.label == "Nothing scheduled today" && !i.enabled));
     }
 
@@ -487,7 +503,7 @@ mod tests {
     fn a_failed_sync_is_visible_in_the_menu() {
         let mut state = connected_state();
         state.last_error = Some("timeout".into());
-        let ui = derive_ui(&state, at(14, 6));
+        let ui = ui(&state, at(14, 6));
         assert!(ui.menu.items.iter().any(|i| i.label.starts_with("\u{26a0} Offline \u{2014} synced 14:03") && !i.enabled));
     }
 
@@ -497,7 +513,7 @@ mod tests {
         state.connected = false;
         state.tasks_now.clear();
         state.tasks_later.clear();
-        let ui = derive_ui(&state, at(14, 6));
+        let ui = ui(&state, at(14, 6));
         assert_eq!(ui.label, "Connect calendar");
         assert!(ui.menu.items.iter().any(|i| i.label == "Connect Google Calendar\u{2026}"));
         assert!(ui.menu.items.iter().any(|i| i.label == "Not connected" && !i.enabled));
@@ -602,7 +618,7 @@ mod tests {
         let mut state = connected_state();
         state.last_error = Some("the calendar did not answer within 30s".into());
         apply(&mut state, &Action::Disconnect);
-        let ui = derive_ui(&state, at(14, 6));
+        let ui = ui(&state, at(14, 6));
         assert!(
             !ui.menu.items.iter().any(|i| i.label.starts_with("\u{26a0} Offline")),
             "disconnecting on purpose is not the same as being offline: {:?}",
@@ -751,8 +767,8 @@ mod tests {
     #[test]
     fn deriving_the_same_menu_twice_gives_every_item_the_same_id() {
         let state = connected_state();
-        let first: Vec<i32> = derive_ui(&state, at(14, 6)).menu.items.iter().map(|i| i.id).collect();
-        let again: Vec<i32> = derive_ui(&state, at(14, 6)).menu.items.iter().map(|i| i.id).collect();
+        let first: Vec<i32> = ui(&state, at(14, 6)).menu.items.iter().map(|i| i.id).collect();
+        let again: Vec<i32> = ui(&state, at(14, 6)).menu.items.iter().map(|i| i.id).collect();
         assert_eq!(first, again);
     }
 
@@ -769,8 +785,11 @@ mod tests {
             task("e2", "Deep work", (15, 30), (17, 0)),
         ];
         state.tasks_later = vec![task("e3", "Standup", (17, 30), (18, 0))];
+        // One memo across both derivations, the way the run loop holds one
+        // across the whole process.
+        let mut ids = TaskIdMemo::default();
         // What the host was given, and what the user is looking at.
-        let published = derive_ui(&state, at(14, 6)).menu;
+        let published = derive_ui(&state, at(14, 6), &mut ids).menu;
         let clicked = id_of(&published, "e2");
 
         // A sync lands while the menu is open: e1 has ended and dropped off
@@ -778,7 +797,7 @@ mod tests {
         // ids handed e2's old id straight to e3.
         state.tasks_now = vec![task("e2", "Deep work", (15, 30), (17, 0))];
         state.tasks_later = vec![task("e3", "Standup", (17, 30), (18, 0))];
-        let fresh = derive_ui(&state, at(15, 40)).menu;
+        let fresh = derive_ui(&state, at(15, 40), &mut ids).menu;
 
         assert_eq!(
             fresh.action_for(clicked),
@@ -795,7 +814,7 @@ mod tests {
         // ids of their own and a click on the vanished one resolves to nothing.
         let mut state = connected_state();
         state.connected = false;
-        let published = derive_ui(&state, at(14, 6)).menu;
+        let published = ui(&state, at(14, 6)).menu;
         let connect = published
             .items
             .iter()
@@ -804,7 +823,7 @@ mod tests {
             .id;
 
         state.connected = true;
-        let fresh = derive_ui(&state, at(14, 6)).menu;
+        let fresh = ui(&state, at(14, 6)).menu;
         assert_eq!(fresh.action_for(connect), None, "a stale Connect click must not disconnect");
     }
 
@@ -824,7 +843,7 @@ mod tests {
         later_only.tasks_now.clear();
 
         for state in [connected, empty, disconnected, later_only] {
-            let menu = derive_ui(&state, at(14, 6)).menu;
+            let menu = ui(&state, at(14, 6)).menu;
             let mut seen = std::collections::HashSet::new();
             for item in &menu.items {
                 assert_ne!(item.id, 0, "an item claimed the DBusMenu root: {:?}", item.label);
@@ -845,6 +864,43 @@ mod tests {
     }
 
     #[test]
+    fn a_block_that_lost_a_collision_never_inherits_the_winners_id() {
+        // `e39516` and `e64020` hash to one slot, so the first takes it and
+        // the second is probed one above. Delete the winner from the calendar
+        // and an assignment rebuilt from scratch would hand its id — the row
+        // the host is still showing as "Deep work" — to the loser, so a click
+        // there would select "Standup". The memo `main` keeps for the life of
+        // the run is what stops that.
+        let mut ids = TaskIdMemo::default();
+        let mut state = connected_state();
+        state.tasks_now = vec![
+            task("e39516", "Deep work", (14, 0), (15, 30)),
+            task("e64020", "Standup", (15, 30), (16, 0)),
+        ];
+        state.tasks_later.clear();
+
+        let published = derive_ui(&state, at(14, 6), &mut ids).menu;
+        let winner = id_of(&published, "e39516");
+        let loser = id_of(&published, "e64020");
+        assert_eq!(loser, winner + 1, "the pair must really collide, or this proves nothing");
+
+        // "Deep work" is deleted; the next sync drops it from the list.
+        state.tasks_now = vec![task("e64020", "Standup", (15, 30), (16, 0))];
+        let fresh = derive_ui(&state, at(14, 40), &mut ids).menu;
+
+        assert_eq!(
+            id_of(&fresh, "e64020"),
+            loser,
+            "a surviving block took the id of the one that left"
+        );
+        assert_eq!(
+            fresh.action_for(winner),
+            None,
+            "a click on the deleted block's row selected a different block"
+        );
+    }
+
+    #[test]
     fn two_blocks_whose_ids_collide_are_still_separately_selectable() {
         // Two event ids that really do hash to the same slot (see
         // `menu_model`'s own test). The menu has to keep them apart.
@@ -854,7 +910,7 @@ mod tests {
             task("e64020", "Standup", (15, 30), (16, 0)),
         ];
         state.tasks_later.clear();
-        let menu = derive_ui(&state, at(14, 6)).menu;
+        let menu = ui(&state, at(14, 6)).menu;
 
         let deep = id_of(&menu, "e39516");
         let standup = id_of(&menu, "e64020");
@@ -870,9 +926,9 @@ mod tests {
     #[test]
     fn a_revision_bump_accompanies_every_menu_change() {
         let mut state = connected_state();
-        let before = derive_ui(&state, at(14, 6)).menu.revision;
+        let before = ui(&state, at(14, 6)).menu.revision;
         apply(&mut state, &Action::SelectTask("e1".into()));
-        let after = derive_ui(&state, at(14, 6)).menu.revision;
+        let after = ui(&state, at(14, 6)).menu.revision;
         assert!(after > before);
     }
 
@@ -887,7 +943,7 @@ mod tests {
         assert!(state.selection.is_none());
         assert!(state.tasks_now.is_empty());
         assert!(state.tasks_later.is_empty());
-        assert_eq!(derive_ui(&state, at(14, 6)).label, "Connect calendar");
+        assert_eq!(ui(&state, at(14, 6)).label, "Connect calendar");
         assert!(effects.contains(&Effect::NotifyRevoked));
         // The same clearing path a deliberate disconnect takes, so the token
         // store is cleared through the one serialised revocation path.

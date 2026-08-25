@@ -10,7 +10,7 @@ use protector::notify;
 use protector::state::{load, restore_selection, save, state_path, PersistedState};
 use protector::sync;
 use protector::token_store::{self, TokenStore};
-use protector::tray::menu_model::Action;
+use protector::tray::menu_model::{Action, TaskIdMemo};
 use protector::tray::{self, Command};
 use tokio::sync::mpsc;
 
@@ -373,6 +373,13 @@ async fn run() -> anyhow::Result<()> {
         ..Default::default()
     };
 
+    // Which id each block's menu item has been given. Held for the whole run,
+    // and threaded through every `derive_ui` below, because that is what makes
+    // an id mean one block and one block only for the life of the process —
+    // see `TaskIdMemo`. A memo rebuilt per derivation would let a departed
+    // block's id be reissued to the block it once collided with.
+    let mut task_ids = TaskIdMemo::default();
+
     // The menu the host was last given. Every click is resolved against this
     // exact copy, never a freshly derived one.
     //
@@ -383,16 +390,18 @@ async fn run() -> anyhow::Result<()> {
     // sync at precisely that moment. Ids are therefore derived from *what an
     // item is*, never from where it sits: a hash of the event id for tasks, a
     // constant for each fixed item (`tray::menu_model::ids`). A block keeps
-    // its id across every sync that does not remove it, so a click that raced
-    // a rebuild still selects the block whose label the user was looking at,
-    // and an id whose block really is gone resolves to nothing.
+    // its id for as long as this process runs — through any sync, including
+    // ones that drop it and ones that bring it back — so a click that raced a
+    // rebuild still selects the block whose label the user was looking at, and
+    // an id whose block is gone resolves to nothing rather than to whatever
+    // took its place.
     //
     // Resolving against the published copy is still what makes the *labels*
     // agree: it is the revision whose text the host is displaying, so the
     // check mark and the task list a click is judged against are the ones on
     // screen. `MenuModel::action_for` returning `None`, and
     // `Action::SelectTask` on an id no longer listed, stay quiet no-ops.
-    let mut published = derive_ui(&state, now);
+    let mut published = derive_ui(&state, now, &mut task_ids);
     let (ui_tx, ui_rx) = tokio::sync::watch::channel(published.clone());
     let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::channel(32);
     // A refused single-instance lock is an expected outcome, not a crash: say so
@@ -591,7 +600,7 @@ async fn run() -> anyhow::Result<()> {
         if effects.contains(&Effect::Quit) {
             break;
         }
-        published = derive_ui(&state, now);
+        published = derive_ui(&state, now, &mut task_ids);
         let _ = ui_tx.send(published.clone());
     }
 

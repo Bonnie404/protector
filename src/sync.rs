@@ -395,7 +395,7 @@ mod tests {
     use crate::token_store::FileStore;
     use crate::core::{apply, derive_ui};
     use crate::task::Selection;
-    use crate::tray::menu_model::Action;
+    use crate::tray::menu_model::{Action, TaskIdMemo};
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -541,7 +541,7 @@ mod tests {
         assert!(effects.contains(&Effect::Persist));
         // The menu the panel would draw from it.
         let labels: Vec<String> =
-            derive_ui(&state, at(14, 30)).menu.items.iter().map(|i| i.label.clone()).collect();
+            derive_ui(&state, at(14, 30), &mut TaskIdMemo::default()).menu.items.iter().map(|i| i.label.clone()).collect();
         assert!(labels.iter().any(|l| l.starts_with("Design review")), "{labels:?}");
         assert!(labels.iter().any(|l| l.starts_with("Deep work")), "{labels:?}");
     }
@@ -608,7 +608,7 @@ mod tests {
         assert!(state.last_error.is_some());
         assert!(state.revision > before, "the menu has to redraw with the offline item");
 
-        let ui = derive_ui(&state, at(14, 30));
+        let ui = derive_ui(&state, at(14, 30), &mut TaskIdMemo::default());
         assert!(ui.menu.items.iter().any(|i| i.label.starts_with("Design review")));
         assert!(ui
             .menu

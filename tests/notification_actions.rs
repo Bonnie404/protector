@@ -123,9 +123,15 @@ async fn fake_server(bus: &PrivateBus) -> (zbus::Connection, zbus::Connection, A
 /// guarantee is what a fixed 300 ms sleep used to approximate — and a signal
 /// emitted before a subscription is simply dropped, which would have made the
 /// assertions below pass without testing anything.
+/// Bounded at 5 s like every other wait here: the handshake is a method call
+/// to the bus, and a bus that accepts the connection but never answers must
+/// fail this test rather than hang it.
 async fn listening(client: &zbus::Connection) -> tokio::sync::mpsc::Receiver<Command> {
     let (tx, rx) = tokio::sync::mpsc::channel(4);
-    let actions = notify::subscribe_actions(client).await.expect("subscribing to ActionInvoked");
+    let actions = tokio::time::timeout(Duration::from_secs(5), notify::subscribe_actions(client))
+        .await
+        .expect("the ActionInvoked subscription must complete")
+        .expect("subscribing to ActionInvoked");
     tokio::spawn(async move {
         let _ = actions.forward(tx).await;
     });
