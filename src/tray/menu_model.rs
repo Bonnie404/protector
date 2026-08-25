@@ -152,7 +152,7 @@ mod tests {
     fn a_separator_is_typed_and_carries_no_label() {
         let props = sample().group_properties(&[2]);
         assert_eq!(props[0].1.get("type").unwrap(), &own("separator"));
-        assert!(props[0].1.get("label").is_none());
+        assert!(!props[0].1.contains_key("label"));
     }
 
     #[test]

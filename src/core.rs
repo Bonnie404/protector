@@ -381,10 +381,10 @@ mod tests {
         let ui = derive_ui(&connected_state(), at(14, 6));
         let labels: Vec<&str> = ui.menu.items.iter().map(|i| i.label.as_str()).collect();
         assert!(labels[0].starts_with("Design review"));
-        assert!(labels.iter().any(|l| *l == "Later today"));
+        assert!(labels.contains(&"Later today"));
         assert!(labels.iter().any(|l| l.starts_with("Deep work")));
-        assert!(labels.iter().any(|l| *l == "Refresh now"));
-        assert!(labels.iter().any(|l| *l == "Quit"));
+        assert!(labels.contains(&"Refresh now"));
+        assert!(labels.contains(&"Quit"));
     }
 
     #[test]

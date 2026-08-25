@@ -39,11 +39,23 @@ calendar_id   = "primary"
 warn_before_minutes = 5
 "#;
 
-pub fn config_path() -> PathBuf {
+/// The directory the config file lives under. Falls back twice rather than
+/// unwrapping, because `dirs::config_dir()` returning `None` is a strange
+/// environment, not a reason to refuse to start.
+fn config_root() -> PathBuf {
     dirs::config_dir()
         .or_else(|| dirs::home_dir().map(|h| h.join(".config")))
         .unwrap_or_else(|| PathBuf::from(".config"))
-        .join("protector/config.toml")
+}
+
+/// The config file under a given root. Split out so a test can pin the suffix
+/// against the *production* join rather than against a copy of it.
+fn config_path_in(base: &Path) -> PathBuf {
+    base.join("protector/config.toml")
+}
+
+pub fn config_path() -> PathBuf {
+    config_path_in(&config_root())
 }
 
 pub fn load_or_create(path: &Path) -> anyhow::Result<Config> {
@@ -66,10 +78,6 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn config_path_with_base(base: &Path) -> PathBuf {
-        base.join("protector/config.toml")
-    }
 
     #[test]
     fn a_missing_config_is_created_from_the_template_and_reports_incomplete() {
@@ -120,14 +128,17 @@ mod tests {
 
     #[test]
     fn config_path_with_a_known_base_returns_the_correct_suffix() {
-        let base = std::path::PathBuf::from("/home/user/.config");
-        let path = config_path_with_base(&base);
-        assert_eq!(path, std::path::PathBuf::from("/home/user/.config/protector/config.toml"));
+        // The production join, not a copy of it: changing where the config
+        // lives has to break this test rather than slip past it.
+        let path = config_path_in(Path::new("/home/user/.config"));
+        assert_eq!(path, PathBuf::from("/home/user/.config/protector/config.toml"));
     }
 
     #[test]
-    fn config_path_returns_a_path_ending_in_protector_config_toml() {
+    fn config_path_is_that_suffix_under_the_real_config_root() {
         let path = config_path();
-        assert!(path.ends_with("protector/config.toml"));
+        assert!(path.ends_with("protector/config.toml"), "{}", path.display());
+        assert!(path.starts_with(config_root()), "{}", path.display());
+        assert_eq!(path, config_path_in(&config_root()));
     }
 }

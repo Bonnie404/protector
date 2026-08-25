@@ -37,11 +37,22 @@ impl PersistedState {
     }
 }
 
-pub fn state_path() -> PathBuf {
+/// The directory the state file lives under. Falls back twice rather than
+/// unwrapping, for the same reason `config::config_root` does.
+fn state_root() -> PathBuf {
     dirs::state_dir()
         .or_else(|| dirs::home_dir().map(|h| h.join(".local/state")))
         .unwrap_or_else(|| PathBuf::from(".local/state"))
-        .join("protector/state.json")
+}
+
+/// The state file under a given root. Split out so a test can pin the suffix
+/// against the *production* join rather than against a copy of it.
+fn state_path_in(base: &Path) -> PathBuf {
+    base.join("protector/state.json")
+}
+
+pub fn state_path() -> PathBuf {
+    state_path_in(&state_root())
 }
 
 /// Never fails: a missing or corrupt state file is not worth refusing to start over.
@@ -86,10 +97,6 @@ mod tests {
     use super::*;
     use chrono::TimeZone;
 
-    fn state_path_with_base(base: &Path) -> PathBuf {
-        base.join("protector/state.json")
-    }
-
     fn at(h: u32, m: u32) -> DateTime<Local> { Local.with_ymd_and_hms(2026, 8, 25, h, m, 0).unwrap() }
 
     fn selection(end: DateTime<Local>) -> Selection {
@@ -100,15 +107,45 @@ mod tests {
         }
     }
 
+    /// Every persisted field, not just the two that are easy to reach:
+    /// dropping `end` from `PersistedSelection` would silently break
+    /// `restore_selection`, and an assertion over `id` and `warned` alone
+    /// would not notice.
     #[test]
-    fn a_saved_state_round_trips() {
+    fn a_saved_state_round_trips_every_field_it_persists() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.json");
-        let original = PersistedState::from_selection(Some(&selection(at(15, 30))), Some(at(14, 3)));
+        let mut sel = selection(at(15, 30));
+        sel.ended_notified = true;
+        let original = PersistedState::from_selection(Some(&sel), Some(at(14, 3)));
         save(&path, &original).unwrap();
+
         let loaded = load(&path);
-        assert_eq!(loaded.selection.as_ref().unwrap().id, "e1");
-        assert!(loaded.selection.as_ref().unwrap().warned);
+        let got = loaded.selection.as_ref().expect("the selection has to survive the round trip");
+        assert_eq!(got.id, "e1");
+        assert_eq!(got.title, "Design review");
+        assert_eq!(got.start, at(14, 0));
+        assert_eq!(got.end, at(15, 30));
+        assert!(got.warned);
+        assert!(got.ended_notified);
+        assert_eq!(loaded.last_sync, Some(at(14, 3)));
+
+        // And what comes back out is the selection that went in, so a field
+        // that round-trips but is never read still counts as broken.
+        let restored = restore_selection(&loaded, at(15, 35)).expect("recent enough to restore");
+        assert_eq!(restored.task, sel.task);
+        assert_eq!(restored.warned, sel.warned);
+        assert_eq!(restored.ended_notified, sel.ended_notified);
+    }
+
+    #[test]
+    fn a_state_with_no_selection_round_trips_as_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        save(&path, &PersistedState::from_selection(None, Some(at(14, 3)))).unwrap();
+        let loaded = load(&path);
+        assert!(loaded.selection.is_none());
+        assert_eq!(loaded.last_sync, Some(at(14, 3)));
     }
 
     #[test]
@@ -140,14 +177,16 @@ mod tests {
 
     #[test]
     fn state_path_with_a_known_base_returns_the_correct_suffix() {
-        let base = PathBuf::from("/home/user/.local/state");
-        let path = state_path_with_base(&base);
+        // The production join, not a copy of it.
+        let path = state_path_in(Path::new("/home/user/.local/state"));
         assert_eq!(path, PathBuf::from("/home/user/.local/state/protector/state.json"));
     }
 
     #[test]
-    fn state_path_returns_a_path_ending_in_protector_state_json() {
+    fn state_path_is_that_suffix_under_the_real_state_root() {
         let path = state_path();
-        assert!(path.ends_with("protector/state.json"));
+        assert!(path.ends_with("protector/state.json"), "{}", path.display());
+        assert!(path.starts_with(state_root()), "{}", path.display());
+        assert_eq!(path, state_path_in(&state_root()));
     }
 }
