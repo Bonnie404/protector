@@ -33,6 +33,9 @@ pub const TEMPLATE: &str = r#"# Protector configuration
 client_id     = ""
 client_secret = ""
 calendar_id   = "primary"
+
+# How many minutes before a block ends Protector sends the heads-up.
+# Set it to 0 to switch that notification off; the end-of-block one still fires.
 warn_before_minutes = 5
 "#;
 
@@ -89,6 +92,22 @@ mod tests {
         assert!(cfg.is_complete());
         assert_eq!(cfg.calendar_id, "primary");
         assert_eq!(cfg.warn_before_minutes, 5);
+    }
+
+    #[test]
+    fn a_configured_warning_window_survives_the_round_trip_from_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "client_id = \"a\"\nclient_secret = \"b\"\nwarn_before_minutes = 15\n")
+            .unwrap();
+        assert_eq!(load_or_create(&path).unwrap().warn_before_minutes, 15);
+    }
+
+    #[test]
+    fn the_template_documents_the_warning_window_it_writes() {
+        // The field is only meaningful to someone who knows it exists.
+        assert!(TEMPLATE.contains("warn_before_minutes = 5"));
+        assert!(TEMPLATE.contains("heads-up"), "{TEMPLATE}");
     }
 
     #[test]

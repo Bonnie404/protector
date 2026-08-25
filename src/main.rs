@@ -3,7 +3,7 @@ use std::sync::Arc;
 use chrono::Local;
 use protector::auth::{self, TokenStore};
 use protector::config;
-use protector::core::{apply, derive_ui, tick, token_revoked, AppState, Effect, WARN_BEFORE_SECS};
+use protector::core::{apply, derive_ui, tick, token_revoked, warn_before_secs, AppState, Effect};
 use protector::notify;
 use protector::state::{load, restore_selection, save, state_path, PersistedState};
 use protector::sync;
@@ -320,8 +320,20 @@ async fn run() -> anyhow::Result<()> {
 
     let now = Local::now();
     let persisted = load(&state_file);
+    // Read once, here, rather than at the notification site: the countdown and
+    // the wording of the message are then driven by the same number and cannot
+    // contradict each other.
+    let warn_before = warn_before_secs(cfg.warn_before_minutes);
+    if warn_before == 0 {
+        eprintln!(
+            "protector: warn_before_minutes is {} in {}, so the heads-up before a block ends is off.",
+            cfg.warn_before_minutes,
+            config::config_path().display()
+        );
+    }
     let mut state = AppState {
         selection: restore_selection(&persisted, now),
+        warn_before_secs: warn_before,
         // Restored so a failed first sync can still say *when* the list it is
         // showing was current.
         last_sync: persisted.last_sync,
@@ -485,7 +497,9 @@ async fn run() -> anyhow::Result<()> {
                 // a distance.
                 Effect::NotifyWarning => {
                     if let Some(sel) = state.selection.as_ref() {
-                        let minutes = WARN_BEFORE_SECS / 60;
+                        // The very value `tick` gated on, so `15 minutes left`
+                        // can never appear five minutes before the end.
+                        let minutes = state.warn_before_secs / 60;
                         if let Err(e) = notify::notify_warning(&conn, &sel.task, minutes).await {
                             eprintln!("protector: failed to send the warning notification: {e}");
                         }

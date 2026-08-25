@@ -90,6 +90,10 @@ warn_before_minutes = 5
 `calendar_id` defaults to `primary` (your main calendar); point it at
 another calendar's id if you want Protector tracking a different one.
 
+`warn_before_minutes` is how long before a block ends you get the heads-up
+notification — 5 by default. Set it to `0` to turn that notification off; the
+end-of-block prompt still fires either way.
+
 ## 4. Connect your account
 
 ```sh

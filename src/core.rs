@@ -4,7 +4,7 @@ use crate::task::{panel_label, Selection, Task};
 use crate::tray::menu_model::{Action, MenuItem, MenuModel};
 use crate::tray::UiState;
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct AppState {
     pub tasks_now: Vec<Task>,
     pub tasks_later: Vec<Task>,
@@ -13,6 +13,29 @@ pub struct AppState {
     pub last_sync: Option<DateTime<Local>>,
     pub last_error: Option<String>,
     pub revision: u32,
+    /// How long before the selected task ends the heads-up fires, from
+    /// `config.warn_before_minutes` (spec §8) via [`warn_before_secs`].
+    /// Held here rather than read from the config at the notification site,
+    /// so the timing and the wording of the message can never disagree.
+    pub warn_before_secs: i64,
+}
+
+/// Hand-written rather than derived, so that `..Default::default()` — which
+/// `main` and several tests use — yields the *documented* warning window
+/// rather than `0`, which would silently mean "never warn".
+impl Default for AppState {
+    fn default() -> Self {
+        Self {
+            tasks_now: Vec::new(),
+            tasks_later: Vec::new(),
+            selection: None,
+            connected: false,
+            last_sync: None,
+            last_error: None,
+            revision: 0,
+            warn_before_secs: WARN_BEFORE_SECS,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -34,8 +57,24 @@ pub enum Effect {
     Persist,
 }
 
-/// How long before a task ends the panel warns once, via `Effect::NotifyWarning`.
+/// The warning window used when `config.toml` says nothing — spec §8
+/// documents `warn_before_minutes = 5`.
 pub const WARN_BEFORE_SECS: i64 = 300;
+
+/// Turns the configured `warn_before_minutes` into the seconds `tick`
+/// compares against.
+///
+/// Zero and negative both mean *no heads-up at all*: "warn me 0 minutes
+/// before it ends" is the end notification, which already fires, and a
+/// negative window would mean warning after the fact. Neither is worth
+/// refusing to start over, so both disable the T-5 notification and `run`
+/// says so once on stderr.
+///
+/// Saturating rather than wrapping: `i64::MAX * 60` overflows, and a mistyped
+/// config must not panic the widget in a debug build.
+pub fn warn_before_secs(minutes: i64) -> i64 {
+    minutes.max(0).saturating_mul(60)
+}
 
 fn item_label(t: &Task) -> String {
     format!("{}   {} \u{2013} {}", t.title, t.start.format("%H:%M"), t.end.format("%H:%M"))
@@ -156,6 +195,7 @@ pub fn apply(state: &mut AppState, action: &Action) -> Vec<Effect> {
 /// notification as the selected task's countdown crosses each threshold.
 pub fn tick(state: &mut AppState, now: DateTime<Local>) -> Vec<Effect> {
     let mut effects = Vec::new();
+    let warn_before = state.warn_before_secs;
     if let Some(sel) = state.selection.as_mut() {
         let remaining = (sel.task.end - now).num_seconds();
         if remaining <= 0 && !sel.ended_notified {
@@ -163,7 +203,10 @@ pub fn tick(state: &mut AppState, now: DateTime<Local>) -> Vec<Effect> {
             sel.warned = true;
             effects.push(Effect::NotifyEnded);
             effects.push(Effect::Persist);
-        } else if remaining > 0 && remaining <= WARN_BEFORE_SECS && !sel.warned {
+        // No special case for a disabled window: `warn_before == 0` makes
+        // `remaining > 0 && remaining <= 0` unsatisfiable, and the branch
+        // above has already handled everything at or past the end.
+        } else if remaining > 0 && remaining <= warn_before && !sel.warned {
             sel.warned = true;
             effects.push(Effect::NotifyWarning);
             effects.push(Effect::Persist);
@@ -270,6 +313,7 @@ mod tests {
             last_sync: Some(at(14, 3)),
             last_error: None,
             revision: 0,
+            warn_before_secs: WARN_BEFORE_SECS,
         }
     }
 
@@ -349,6 +393,64 @@ mod tests {
         let second = tick(&mut state, at(15, 32));
         assert!(first.iter().any(|e| matches!(e, Effect::NotifyEnded)));
         assert!(!second.iter().any(|e| matches!(e, Effect::NotifyEnded)));
+    }
+
+    #[test]
+    fn a_configured_warning_window_is_what_tick_actually_gates_on() {
+        // The whole point of `warn_before_minutes`: 15 in the config has to
+        // mean fifteen, not the hardcoded five.
+        let mut state = connected_state();
+        state.warn_before_secs = warn_before_secs(15);
+        apply(&mut state, &Action::SelectTask("e1".into()));
+        // 14:45 is ten minutes before the 15:30 end: inside a 15 minute
+        // window, well outside the default 5 minute one.
+        let effects = tick(&mut state, at(15, 20));
+        assert!(
+            effects.iter().any(|e| matches!(e, Effect::NotifyWarning)),
+            "a 15 minute window must warn 10 minutes out: {effects:?}"
+        );
+
+        let mut default_window = connected_state();
+        apply(&mut default_window, &Action::SelectTask("e1".into()));
+        let effects = tick(&mut default_window, at(15, 20));
+        assert!(
+            !effects.iter().any(|e| matches!(e, Effect::NotifyWarning)),
+            "and the default 5 minute window must not: {effects:?}"
+        );
+    }
+
+    #[test]
+    fn a_zero_warning_window_turns_the_heads_up_off_without_touching_the_end() {
+        let mut state = connected_state();
+        state.warn_before_secs = warn_before_secs(0);
+        apply(&mut state, &Action::SelectTask("e1".into()));
+        for minute in 20..30 {
+            let effects = tick(&mut state, at(15, minute));
+            assert!(
+                !effects.iter().any(|e| matches!(e, Effect::NotifyWarning)),
+                "a zero window must never warn (at 15:{minute}): {effects:?}"
+            );
+        }
+        // The end notification is a separate promise and still has to land.
+        let effects = tick(&mut state, at(15, 31));
+        assert!(effects.iter().any(|e| matches!(e, Effect::NotifyEnded)), "{effects:?}");
+    }
+
+    #[test]
+    fn a_nonsense_warning_window_is_clamped_rather_than_panicking() {
+        assert_eq!(warn_before_secs(15), 900);
+        assert_eq!(warn_before_secs(5), WARN_BEFORE_SECS);
+        assert_eq!(warn_before_secs(0), 0, "zero means no heads-up");
+        assert_eq!(warn_before_secs(-5), 0, "and so does a negative window");
+        // `i64::MAX * 60` overflows; a mistyped config must not panic a debug build.
+        assert_eq!(warn_before_secs(i64::MAX), i64::MAX);
+    }
+
+    #[test]
+    fn an_unconfigured_state_still_warns_at_the_documented_five_minutes() {
+        // `..Default::default()` is how `main` builds its state, so the
+        // default must be the documented window and not a silent zero.
+        assert_eq!(AppState::default().warn_before_secs, WARN_BEFORE_SECS);
     }
 
     #[test]
