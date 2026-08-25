@@ -9,7 +9,6 @@ pub struct Task {
 }
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct Selection {
     pub task: Task,
     pub warned: bool,

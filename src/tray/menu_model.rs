@@ -7,9 +7,6 @@ pub fn own<'a, T: Into<Value<'a>>>(v: T) -> OwnedValue {
     OwnedValue::try_from(v.into()).expect("menu property values are plain data")
 }
 
-// Connect/Disconnect/Quit are part of the Action surface Task 3's D-Bus
-// handlers dispatch on; nothing in Task 2 constructs them yet.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
     SelectTask(String),
@@ -73,8 +70,6 @@ pub struct Layout {
 
 #[derive(Debug, Clone, Default)]
 pub struct MenuModel {
-    // Read by Task 3 when reporting the layout revision to DBusMenu clients.
-    #[allow(dead_code)]
     pub revision: u32,
     pub items: Vec<MenuItem>,
 }
