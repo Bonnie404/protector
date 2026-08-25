@@ -301,12 +301,22 @@ impl Drop for LoginReport {
 /// `std::process::exit`, which runs no destructors and waits for nothing, so a
 /// dropped `JoinHandle` here means *Disconnect account* followed by *Quit* can
 /// leave a live refresh token on disk while the panel says `Not connected`.
-/// On a locked keyring that window is `KEYRING_TIMEOUT` wide — ten seconds,
-/// exactly when the credential matters most.
+/// On a locked keyring that window is `token_store::KEYRING_TIMEOUT` wide —
+/// ten seconds, exactly when the credential matters most.
 ///
-/// The cost is that the run loop stops for as long as the clear takes, so the
-/// label can freeze for up to those ten seconds. That is the right way round:
-/// a frozen countdown is a cosmetic fault, a surviving credential is not.
+/// The cost is that the run loop stops for as long as the disconnect takes,
+/// and that is **two** keyring timeouts, not one — about twenty seconds:
+///
+/// * `TokenWrites::revoke_all_stores` first waits on `enter()`, and a sync's
+///   rotated-token write can be holding that lock inside `KeyringStore::save`,
+///   which `guarded` bounds at `KEYRING_TIMEOUT` (10s) before abandoning the
+///   thread and releasing the lock.
+/// * It then runs `KeyringStore::clear`, `guarded` by the same 10s.
+///
+/// So the label can freeze for up to roughly twenty seconds — and only on a
+/// keyring that has stopped answering, which is also the only case where
+/// either half runs long. That is the right way round: a frozen countdown is a
+/// cosmetic fault, a surviving credential is not.
 async fn forget_account() {
     let cleared = tokio::task::spawn_blocking(|| {
         // `revoke_all_stores` bumps the write epoch under the same lock a token
