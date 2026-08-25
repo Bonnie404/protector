@@ -262,8 +262,15 @@ impl From<TokenResponse> for Tokens {
         Tokens {
             access_token: r.access_token,
             refresh_token: r.refresh_token,
-            // 60s of slack so a request never starts with an almost-expired token.
-            expires_at: Local::now() + Duration::seconds(r.expires_in - 60),
+            // 60s of slack so a request never starts with an almost-expired
+            // token, but never *behind* now: a server answering with less
+            // than 60 would otherwise mint a token that is already expired,
+            // `Syncer::access_token`'s freshness check would fail on every
+            // call, and the sync loop would refresh on every attempt. A
+            // quota'd token endpoint answers that with `invalid_grant`, which
+            // this branch reads as *revoked* — so a short-lived token would
+            // end in the account being disconnected.
+            expires_at: Local::now() + Duration::seconds((r.expires_in - 60).max(1)),
         }
     }
 }
@@ -655,8 +662,18 @@ pub fn shared_token_store() -> std::sync::Arc<dyn TokenStore> {
 /// The two operations take turns instead. Every write states the epoch it
 /// began in; every revocation bumps the epoch under the same lock the write
 /// must hold. A write whose epoch is stale is dropped rather than applied, and
-/// a write already in progress finishes *before* the clear that follows it —
-/// so there is no interleaving in which a live token survives a revocation.
+/// a write that *returns* returns before the clear that follows it.
+///
+/// One exception, and it is a real one rather than a theoretical one:
+/// `guarded` gives a keyring call `KEYRING_TIMEOUT` and then **abandons** the
+/// thread running it, returning an error and releasing this mutex while the
+/// underlying `set_password` is still in flight. A revocation can then take
+/// the lock, bump the epoch and clear every store, and the abandoned write can
+/// land afterwards — leaving a live refresh token behind a disconnect that
+/// reported success. Nothing here can call that thread back; the alternative
+/// is a panel widget that hangs forever on a locked keyring, so this is the
+/// trade that was chosen. `protector logout` clears every store, so a later
+/// one still finds such a token.
 pub struct TokenWrites {
     lock: std::sync::Mutex<()>,
     epoch: std::sync::atomic::AtomicU64,
@@ -1113,6 +1130,40 @@ mod tests {
         assert!(!rendered.contains("ya29.access"), "{rendered}");
         assert!(!rendered.contains("1//refresh"), "{rendered}");
         assert!(rendered.contains("Tokens"), "{rendered}");
+    }
+
+    // ---- The token endpoint's answer ----------------------------------------
+
+    fn response(expires_in: i64) -> Tokens {
+        TokenResponse {
+            access_token: "ya29.example".into(),
+            refresh_token: None,
+            expires_in,
+        }
+        .into()
+    }
+
+    #[test]
+    fn an_ordinary_hour_long_token_keeps_a_minute_of_slack() {
+        let remaining = (response(3599).expires_at - Local::now()).num_seconds();
+        assert!((3530..=3539).contains(&remaining), "got {remaining}s");
+    }
+
+    /// Google returns 3599, but nothing forces that. A lifetime shorter than
+    /// the 60s of slack must not produce a token that is born expired: the
+    /// freshness check in `Syncer::access_token` would then fail on every
+    /// call, the sync loop would refresh on every attempt, and a token
+    /// endpoint that answers that abuse with `invalid_grant` would get the
+    /// account disconnected as revoked.
+    #[test]
+    fn a_short_lived_token_is_never_born_expired() {
+        for expires_in in [59, 30, 1, 0, -1] {
+            let expires_at = response(expires_in).expires_at;
+            assert!(
+                expires_at > Local::now(),
+                "expires_in = {expires_in} produced an already-expired token"
+            );
+        }
     }
 
     // ---- Token stores -------------------------------------------------------

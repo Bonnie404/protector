@@ -362,13 +362,24 @@ async fn run() -> anyhow::Result<()> {
         ..Default::default()
     };
 
-    // The menu the host currently has. Every click is resolved against this
-    // exact copy, never a freshly derived one: the host can only ever be
-    // clicking on ids it was actually shown, so this is the only version whose
-    // ids are guaranteed to still mean what they meant when the host rendered
-    // them. Re-deriving before resolving would race a concurrent tick/sync that
-    // renumbers the menu between render and click, misattributing the click to
-    // a neighbouring item.
+    // The menu the host was last given. Every click is resolved against this
+    // exact copy, never a freshly derived one.
+    //
+    // What that buys: ids are stable *within a revision* (spec §5), and this
+    // is the most recent revision published, so resolving against it cannot
+    // be raced by a tick or a sync that renumbers the menu between the render
+    // and the click — which is exactly what re-deriving on every click would
+    // be.
+    //
+    // What it does not buy: certainty that the host is looking at this
+    // revision. That would hold only for a host that re-fetches the layout on
+    // every `LayoutUpdated`, and one whose menu is already open may not —
+    // while `AboutToShow` deliberately fires a sync at precisely that moment.
+    // So a click can still arrive against a revision that has since been
+    // renumbered. That is why `MenuModel::action_for` returning `None`, and
+    // `Action::SelectTask` on an id no longer listed, are both quiet no-ops
+    // rather than errors. Content-derived ids would close the gap outright;
+    // it is recorded as a follow-up.
     let mut published = derive_ui(&state, now);
     let (ui_tx, ui_rx) = tokio::sync::watch::channel(published.clone());
     let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::channel(32);
