@@ -37,11 +37,17 @@ takes about five minutes and costs nothing.
 3. Under **APIs & Services → OAuth consent screen**, configure a consent
    screen:
    - User type: **External** is fine — you do not need a Workspace account.
-   - Publishing status: leave it in **Testing**. There is no need to submit
-     it for verification; a testing-mode app works indefinitely for its own
-     test users.
-   - Under **Test users**, add your own Google account's email address. This
-     is the account whose calendar Protector will read.
+   - Publishing status: **Testing** is the quickest way to start. See the
+     note below about the seven-day limit before you settle on it.
+   - Under **Test users** (newer console: **Google Auth Platform →
+     Audience → Test users**), add your own Google account's email address.
+     This is the account whose calendar Protector will read.
+
+     **This step is not optional.** While the app is in Testing, only the
+     accounts listed here may authorize it — being the owner of the Cloud
+     project is not enough. Skipping it makes `protector login` fail with
+     `Error 403: access_denied` and a message about the app not having
+     completed Google verification.
 4. Under **APIs & Services → Credentials**, click **Create credentials →
    OAuth client ID**.
    - Application type: **Desktop app**. (Not "Web application" — Protector
@@ -50,6 +56,27 @@ takes about five minutes and costs nothing.
    - Give it any name you like and create it.
 5. Copy the **Client ID** and **Client secret** it shows you — you'll paste
    them into `config.toml` in the next step.
+
+### Testing status expires every seven days
+
+While the consent screen sits in **Testing**, Google expires each
+authorization — and the refresh token with it — [seven days after you
+consent](https://support.google.com/cloud/answer/15549945?hl=en). Protector
+notices, clears the dead token, and the panel goes back to
+`Connect calendar`; you run `protector login` again and carry on. Nothing
+breaks, but it is a weekly interruption.
+
+To avoid it, set the publishing status to **In production** on the same
+Audience page. Verification is only required to distribute an app to other
+people: an unverified production app still works for you, with two
+consequences worth knowing. The consent screen shows a "Google hasn't
+verified this app" warning that you click through once via **Advanced → Go
+to Protector (unsafe)**, and the app is capped at 100 users, which is
+irrelevant when the only user is you. In exchange the refresh token stops
+expiring on a timer.
+
+Either choice is fine — Testing is less alarming to click through, In
+production is less to think about.
 
 ## 2. Install
 
