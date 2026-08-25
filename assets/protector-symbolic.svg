@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" width="16" height="16">
+  <!-- Symbolic hourglass. fill=currentColor only gets recoloured because the
+       FILE IS NAMED -symbolic: that suffix is what makes GTK look the icon up
+       symbolically and substitute the panel's foreground colour. Named without
+       it, currentColor resolves to black and vanishes on a dark panel. See
+       protector-attention.svg for the overtime state, which is deliberately
+       NOT symbolic so its red survives. -->
+  <path fill="currentColor" d="M3,2 L13,2 L13,3 L8,8 L13,13 L13,14 L3,14 L3,13 L8,8 L3,3 Z"/>
+</svg>

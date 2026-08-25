@@ -21,7 +21,7 @@ echo "==> Installing binary to $BIN_DIR/protector"
 install -Dm755 target/release/protector "$BIN_DIR/protector"
 
 echo "==> Installing icons to $PREFIX/.local/share/icons/hicolor/scalable/apps/"
-install -Dm644 assets/protector.svg "$PREFIX/.local/share/icons/hicolor/scalable/apps/protector.svg"
+install -Dm644 assets/protector-symbolic.svg "$PREFIX/.local/share/icons/hicolor/scalable/apps/protector-symbolic.svg"
 install -Dm644 assets/protector-attention.svg "$PREFIX/.local/share/icons/hicolor/scalable/apps/protector-attention.svg"
 
 echo "==> Refreshing the icon cache"

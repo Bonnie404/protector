@@ -214,7 +214,7 @@ and before the unit that might restart it is gone:
 systemctl --user disable --now protector.service   # if you had enabled it
 protector logout                                   # clears the stored token
 rm ~/.local/bin/protector
-rm ~/.local/share/icons/hicolor/scalable/apps/protector.svg
+rm ~/.local/share/icons/hicolor/scalable/apps/protector-symbolic.svg
 rm ~/.local/share/icons/hicolor/scalable/apps/protector-attention.svg
 rm ~/.config/systemd/user/protector.service
 systemctl --user daemon-reload

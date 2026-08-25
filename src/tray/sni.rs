@@ -51,7 +51,9 @@ impl StatusNotifierItem {
         if self.ui.borrow().attention {
             "protector-attention"
         } else {
-            "protector"
+            // The -symbolic suffix is load-bearing: it is what makes the panel
+            // recolour the icon to its foreground instead of drawing it black.
+            "protector-symbolic"
         }
     }
 

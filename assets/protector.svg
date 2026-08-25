@@ -1,7 +1,0 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" width="16" height="16">
-  <!-- Symbolic hourglass: fill=currentColor so the panel/theme sets the
-       colour, the same way GNOME's own -symbolic icons work. Used as the
-       normal (not-in-overtime) icon; see protector-attention.svg for the
-       overtime state, which is deliberately NOT symbolic. -->
-  <path fill="currentColor" d="M3,2 L13,2 L13,3 L8,8 L13,13 L13,14 L3,14 L3,13 L8,8 L3,3 Z"/>
-</svg>

@@ -424,7 +424,10 @@ async fn the_item_serves_every_property_the_spec_names_by_value() {
     assert_eq!(s("Id").await, "protector");
     assert_eq!(s("Title").await, "Protector");
     assert_eq!(s("Status").await, "Active");
-    assert_eq!(s("IconName").await, "protector");
+    // -symbolic is what makes the panel recolour it to its foreground; without
+    // the suffix currentColor resolves to black and the icon vanishes on a dark
+    // panel. Id stays "protector" — that is the item's identity, not an icon.
+    assert_eq!(s("IconName").await, "protector-symbolic");
     assert_eq!(s("AttentionIconName").await, "protector-attention");
     assert_eq!(s("IconThemePath").await, "", "icons come from the hicolor theme");
     assert_eq!(s("XAyatanaLabel").await, "42:17 \u{b7} Design review");
