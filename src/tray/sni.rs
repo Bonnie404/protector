@@ -24,7 +24,13 @@ impl StatusNotifierItem {
         "Protector"
     }
 
-    #[zbus(property)]
+    /// `emits_changed_signal = "false"` because the change is announced as
+    /// `NewStatus`, which is what SNI hosts listen for — no `PropertiesChanged`
+    /// is ever emitted for it. Left at the default `"true"` the introspection
+    /// XML would promise a signal that never comes, and a host that cached the
+    /// property on that promise would sit on `Active` through the whole of
+    /// overtime.
+    #[zbus(property(emits_changed_signal = "false"))]
     async fn status(&self) -> String {
         if self.ui.borrow().attention {
             "NeedsAttention".into()
@@ -37,7 +43,10 @@ impl StatusNotifierItem {
     /// hosts read only this property and never switch to the dedicated
     /// attention icon on their own, so the overtime icon has to be reachable
     /// through both paths.
-    #[zbus(property)]
+    ///
+    /// `emits_changed_signal = "false"` for the same reason as `Status`: the
+    /// change travels as `NewIcon`, never as `PropertiesChanged`.
+    #[zbus(property(emits_changed_signal = "false"))]
     async fn icon_name(&self) -> &str {
         if self.ui.borrow().attention {
             "protector-attention"
