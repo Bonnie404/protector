@@ -276,18 +276,49 @@ struct TokenError {
     error: Option<String>,
 }
 
+/// The token endpoint's answer to a request it refused, kept as a typed,
+/// downcastable error rather than folded into a string immediately: a caller
+/// — `sync.rs` — needs to tell a revoked refresh token apart from an ordinary
+/// failure (network, 5xx, timeout), and matching on rendered prose would be
+/// one rewording away from silently breaking that.
+#[derive(Debug)]
+pub struct TokenRequestError {
+    pub status: reqwest::StatusCode,
+    pub code: Option<String>,
+}
+
+impl std::fmt::Display for TokenRequestError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.code {
+            Some(code) => write!(f, "the Google token endpoint refused the request ({}: {code})", self.status),
+            None => write!(f, "the Google token endpoint refused the request ({})", self.status),
+        }
+    }
+}
+
+impl std::error::Error for TokenRequestError {}
+
+/// True when `err` is a token-endpoint refusal whose short OAuth code is
+/// `invalid_grant` — Google's signal that the refresh token itself is no
+/// longer valid (revoked from the Account permissions page, or expired from
+/// long disuse), as distinct from a transient failure that is worth retrying.
+///
+/// Only meaningful for an error that came out of a *refresh* grant. Nothing
+/// in `sync.rs` — the only caller — ever surfaces the authorization-code
+/// exchange through this path, so that distinction does not need to be made
+/// here.
+pub fn is_revoked_refresh(err: &anyhow::Error) -> bool {
+    err.chain()
+        .find_map(|cause| cause.downcast_ref::<TokenRequestError>())
+        .is_some_and(|e| e.code.as_deref() == Some("invalid_grant"))
+}
+
 async fn post_token(endpoint: &str, form: &[(&str, &str)]) -> anyhow::Result<Tokens> {
     let response = reqwest::Client::new().post(endpoint).form(form).send().await?;
     let status = response.status();
     if !status.is_success() {
-        let code = response
-            .json::<TokenError>()
-            .await
-            .ok()
-            .and_then(|e| e.error)
-            .map(|e| format!(": {e}"))
-            .unwrap_or_default();
-        anyhow::bail!("the Google token endpoint refused the request ({status}{code})");
+        let code = response.json::<TokenError>().await.ok().and_then(|e| e.error);
+        return Err(TokenRequestError { status, code }.into());
     }
     let parsed: TokenResponse = response.json().await?;
     Ok(parsed.into())
@@ -984,6 +1015,66 @@ mod tests {
         assert!(!rendered.contains("expired or revoked"), "echoed the description: {rendered}");
         // The short OAuth code is safe and is the one thing worth surfacing.
         assert!(rendered.contains("invalid_grant"), "unhelpful error: {rendered}");
+    }
+
+    // ---- Telling a revoked refresh token apart from an ordinary failure -----
+
+    #[tokio::test]
+    async fn a_refresh_rejected_as_invalid_grant_is_detected_as_revoked() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "error": "invalid_grant",
+            })))
+            .mount(&server)
+            .await;
+
+        let err = refresh_at(&cfg(), "1//old-refresh", &format!("{}/token", server.uri()))
+            .await
+            .unwrap_err();
+        assert!(is_revoked_refresh(&err), "an invalid_grant refusal must read as revoked");
+    }
+
+    #[tokio::test]
+    async fn a_5xx_refresh_failure_is_not_treated_as_revoked() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+
+        let err = refresh_at(&cfg(), "1//old-refresh", &format!("{}/token", server.uri()))
+            .await
+            .unwrap_err();
+        assert!(!is_revoked_refresh(&err), "a transient outage must not look like a revocation");
+    }
+
+    #[tokio::test]
+    async fn a_different_oauth_code_is_not_treated_as_revoked() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "error": "invalid_client",
+            })))
+            .mount(&server)
+            .await;
+
+        let err = refresh_at(&cfg(), "1//old-refresh", &format!("{}/token", server.uri()))
+            .await
+            .unwrap_err();
+        assert!(!is_revoked_refresh(&err), "only invalid_grant means the refresh token was revoked");
+    }
+
+    #[test]
+    fn a_network_error_is_not_treated_as_revoked() {
+        // No mock is mounted, so the request never gets an HTTP response at
+        // all — this exercises the branch that never reaches `post_token`'s
+        // `TokenRequestError`.
+        let err = anyhow::anyhow!("connection refused");
+        assert!(!is_revoked_refresh(&err));
     }
 
     #[test]

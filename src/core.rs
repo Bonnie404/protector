@@ -27,6 +27,10 @@ pub enum Effect {
     /// driving has been dropped and the user has to be told, since nothing on
     /// screen would otherwise explain the label falling back to `Pick a task`.
     NotifyRemoved,
+    /// The refresh token was revoked at Google's end — distinct from an
+    /// ordinary failed sync, which only means the network could not be
+    /// reached. Fired by `token_revoked`, never by `tick` or `reconcile`.
+    NotifyRevoked,
     Persist,
 }
 
@@ -200,6 +204,38 @@ pub fn reconcile(state: &mut AppState, fresh: &[Task]) -> Vec<Effect> {
         }
     }
     effects
+}
+
+/// Handles a refresh token that Google has revoked (spec §9): distinct from
+/// an ordinary sync failure, which only ever raises `last_error` and leaves
+/// the last good task list in place. A revocation instead disconnects
+/// outright — the same state change `Action::Disconnect` makes, so the label
+/// falls back to `Connect calendar` — and adds exactly one notification.
+///
+/// This does not go through `sync::apply_sync`: that function's `Result<Vec<Task>,
+/// String>` has already lost the distinction by the time it would see it, and
+/// folding "revoked" into it would risk it silently decaying into the
+/// ordinary `⚠ Offline` path on the next refactor. `sync.rs` detects the
+/// revocation itself and calls this instead.
+///
+/// Idempotent by checking `state.connected` first: called again once already
+/// disconnected — a duplicate command, a race between two callers — this is a
+/// no-op, so nothing here can double-notify on its own. (`sync.rs` separately
+/// guarantees the command itself is sent at most once, by ending the sync
+/// task the moment it detects the revocation.)
+pub fn token_revoked(state: &mut AppState) -> Vec<Effect> {
+    if !state.connected {
+        return vec![];
+    }
+    state.connected = false;
+    state.selection = None;
+    state.tasks_now.clear();
+    state.tasks_later.clear();
+    // Leaving this set would hang a `⚠ Offline` item under `Not connected`
+    // for the rest of the session, same reasoning as `Action::Disconnect`.
+    state.last_error = None;
+    state.revision += 1;
+    vec![Effect::Logout, Effect::NotifyRevoked, Effect::Persist]
 }
 
 /// How long to wait before retrying after `consecutive_failures` failed syncs:
@@ -432,5 +468,37 @@ mod tests {
         apply(&mut state, &Action::SelectTask("e1".into()));
         let after = derive_ui(&state, at(14, 6)).menu.revision;
         assert!(after > before);
+    }
+
+    // ---- A revoked refresh token --------------------------------------------
+
+    #[test]
+    fn a_revoked_token_disconnects_clears_the_selection_and_notifies_once() {
+        let mut state = connected_state();
+        apply(&mut state, &Action::SelectTask("e1".into()));
+        let effects = token_revoked(&mut state);
+        assert!(!state.connected);
+        assert!(state.selection.is_none());
+        assert!(state.tasks_now.is_empty());
+        assert!(state.tasks_later.is_empty());
+        assert_eq!(derive_ui(&state, at(14, 6)).label, "Connect calendar");
+        assert!(effects.contains(&Effect::NotifyRevoked));
+        // The same clearing path a deliberate disconnect takes, so the token
+        // store is cleared through the one serialised revocation path.
+        assert!(effects.contains(&Effect::Logout));
+    }
+
+    #[test]
+    fn a_revoked_token_does_not_notify_a_second_time() {
+        let mut state = connected_state();
+        token_revoked(&mut state);
+        let second = token_revoked(&mut state);
+        assert!(second.is_empty(), "a second revocation must not notify again: {second:?}");
+    }
+
+    #[test]
+    fn a_revoked_token_is_harmless_when_nothing_was_connected() {
+        let mut state = AppState { connected: false, ..Default::default() };
+        assert!(token_revoked(&mut state).is_empty());
     }
 }

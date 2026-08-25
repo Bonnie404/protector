@@ -3,9 +3,11 @@ use std::sync::Arc;
 use chrono::Local;
 use protector::auth::{self, TokenStore};
 use protector::config;
-use protector::core::{apply, derive_ui, tick, AppState, Effect};
+use protector::core::{apply, derive_ui, tick, token_revoked, AppState, Effect, WARN_BEFORE_SECS};
+use protector::notify;
 use protector::state::{load, restore_selection, save, state_path, PersistedState};
 use protector::sync;
+use protector::tray::menu_model::Action;
 use protector::tray::{self, Command};
 use tokio::sync::mpsc;
 
@@ -350,6 +352,20 @@ async fn run() -> anyhow::Result<()> {
         }
     };
 
+    // Turns a pressed notification button into `Command::SelectById`. Holds
+    // its own clone of `conn` for as long as the process runs, the same way
+    // `register_and_watch` and `spawn_emitter` already do; `conn.close()` at
+    // shutdown does not wait on it.
+    {
+        let conn = conn.clone();
+        let tx = cmd_tx.clone();
+        tokio::spawn(async move {
+            if let Err(e) = notify::watch_actions(conn, tx).await {
+                eprintln!("protector: the notification action listener stopped: {e}");
+            }
+        });
+    }
+
     let ticker_tx = cmd_tx.clone();
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));
@@ -421,6 +437,15 @@ async fn run() -> anyhow::Result<()> {
                 eprintln!("protector: connecting the account failed: {e}");
                 vec![]
             }
+            // A notification action button, resolved the same way a menu
+            // click is: through `Action::SelectTask`, so a stale id (the
+            // task list changed under the notification) is silently a no-op
+            // rather than a crash, exactly as a stale menu id already is.
+            Command::SelectById(id) => apply(&mut state, &Action::SelectTask(id)),
+            // Distinct from an ordinary `Command::Synced(Err(_))`: the
+            // refresh token itself is gone, not merely unreachable, so this
+            // disconnects outright rather than showing `⚠ Offline`.
+            Command::TokenRevoked => token_revoked(&mut state),
         };
         // Checked as membership, not vector position, and always ahead of the
         // Quit check below: `Action::Quit` currently produces `[Effect::Quit]`
@@ -454,6 +479,48 @@ async fn run() -> anyhow::Result<()> {
                     drop(sync.take());
                     forget_account();
                 }
+                // `tick` never emits `NotifyWarning`/`NotifyEnded` without a
+                // selection in hand, so the `if let` below is not a silent
+                // no-op path in practice — it just avoids trusting that from
+                // a distance.
+                Effect::NotifyWarning => {
+                    if let Some(sel) = state.selection.as_ref() {
+                        let minutes = WARN_BEFORE_SECS / 60;
+                        if let Err(e) = notify::notify_warning(&conn, &sel.task, minutes).await {
+                            eprintln!("protector: failed to send the warning notification: {e}");
+                        }
+                    }
+                }
+                Effect::NotifyEnded => {
+                    if let Some(sel) = state.selection.as_ref() {
+                        if let Err(e) = notify::notify_ended(&conn, &sel.task, &state.tasks_later).await {
+                            eprintln!("protector: failed to send the end-of-task notification: {e}");
+                        }
+                    }
+                }
+                Effect::NotifyRemoved => {
+                    if let Err(e) = notify::notify_simple(
+                        &conn,
+                        "Task removed",
+                        "The selected event was deleted from your calendar.",
+                    )
+                    .await
+                    {
+                        eprintln!("protector: failed to send the removal notification: {e}");
+                    }
+                }
+                Effect::NotifyRevoked => {
+                    if let Err(e) = notify::notify_simple(
+                        &conn,
+                        "Reconnect required",
+                        "Google access was revoked. Choose \u{201c}Connect Google Calendar\u{2026}\u{201d} \
+                         in the menu to sign in again.",
+                    )
+                    .await
+                    {
+                        eprintln!("protector: failed to send the reconnect notification: {e}");
+                    }
+                }
                 _ => {}
             }
         }
@@ -466,8 +533,9 @@ async fn run() -> anyhow::Result<()> {
 
     // Explicit, deliberate shutdown rather than letting `main` return and
     // relying on the runtime to tear the still-running background tasks down
-    // on its own: `register_and_watch` and `spawn_emitter` each hold a
-    // `Connection` clone forever (their loops never exit), so
+    // on its own: `register_and_watch`, `spawn_emitter` and the notification
+    // action listener each hold a `Connection` clone forever (their loops
+    // never exit), so
     // `conn.graceful_shutdown()` — which waits for every other clone to drop —
     // would hang here. `close()` instead closes the shared socket immediately
     // without waiting on those clones, flushing any in-flight write so the bus

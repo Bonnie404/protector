@@ -26,6 +26,13 @@ pub enum Command {
     MenuClicked(i32),
     AboutToShow,
     SecondaryActivate,
+    /// A notification action button was pressed: select that task, the same
+    /// path a menu click on it would take.
+    SelectById(String),
+    /// The stored refresh token was rejected by Google as revoked — distinct
+    /// from an ordinary failed sync, which only means the network could not
+    /// be reached.
+    TokenRevoked,
 }
 
 /// Protector claims two well-known names on one connection, and they are not

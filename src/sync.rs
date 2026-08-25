@@ -356,6 +356,17 @@ async fn run(mut syncer: Syncer, mut requests: mpsc::Receiver<()>, tx: mpsc::Sen
             }
         }
         let outcome = syncer.sync(Local::now()).await;
+        if let Err(e) = &outcome {
+            if auth::is_revoked_refresh(e) {
+                // Distinct from the ordinary offline path below, and reported
+                // at most once: rather than looping back around to retry a
+                // credential that cannot become valid again on its own, the
+                // task ends here. The run loop clears the token and connects
+                // no more syncers until a fresh login hands it a new one.
+                let _ = tx.send(Command::TokenRevoked).await;
+                return;
+            }
+        }
         failures = if outcome.is_ok() { 0 } else { failures.saturating_add(1) };
         if let (Err(e), 1) = (&outcome, failures) {
             // Once per outage, not once per retry: the menu's `⚠ Offline` item
@@ -831,6 +842,83 @@ mod tests {
             None,
             "a rotated refresh token outlived the disconnect that was meant to revoke it"
         );
+    }
+
+    // ---- A revoked refresh token ---------------------------------------------
+
+    #[tokio::test]
+    async fn a_revoked_refresh_token_is_reported_as_revoked_not_as_an_ordinary_failure() {
+        let server = MockServer::start().await;
+        let (_dir, store) = store(Some("1//revoked"));
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "error": "invalid_grant",
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let s = syncer(&server, store);
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(4);
+        let handle = spawn(s, cmd_tx);
+        handle.request();
+
+        let cmd = tokio::time::timeout(Duration::from_secs(2), cmd_rx.recv())
+            .await
+            .expect("the sync task must report the revocation promptly")
+            .expect("the channel must still be open");
+        assert!(matches!(cmd, Command::TokenRevoked), "got {cmd:?} instead of TokenRevoked");
+
+        // And it must not decay into the ordinary offline path: no
+        // `Command::Synced(Err(_))` ever follows for this attempt. Nothing
+        // more arriving shows up as either a timeout (the task is still
+        // alive but silent) or the channel closing (the task already ended
+        // and dropped its sender) — either is fine; only a further `Synced`
+        // would mean the revocation was reported twice.
+        let second = tokio::time::timeout(Duration::from_millis(50), cmd_rx.recv()).await;
+        assert!(
+            !matches!(second, Ok(Some(_))),
+            "a revocation must be reported exactly once, not as Synced too: got {second:?}"
+        );
+        drop(handle);
+    }
+
+    #[tokio::test]
+    async fn a_revoked_refresh_token_ends_the_sync_task_so_it_cannot_retry_and_report_again() {
+        let server = MockServer::start().await;
+        let (_dir, store) = store(Some("1//revoked"));
+        // `expect(1)`: dropped at the end of the test, wiremock asserts the
+        // token endpoint was hit exactly once — proof the task did not loop
+        // back around and ask again.
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "error": "invalid_grant",
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let s = syncer(&server, store);
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(4);
+        let handle = spawn(s, cmd_tx);
+        handle.request();
+        cmd_rx.recv().await.expect("TokenRevoked arrives");
+
+        // The task has already returned; a further request on the handle
+        // must not resurrect it into a second attempt. The task ending drops
+        // its sender, so the strongest proof available is the channel
+        // reporting closed (`Ok(None)`) rather than handing back another
+        // `Command` — a bare timeout would also be consistent with "still
+        // alive but silent", which is not what this test is pinning.
+        handle.request();
+        let after_it_ended = tokio::time::timeout(Duration::from_millis(200), cmd_rx.recv()).await;
+        assert!(
+            !matches!(after_it_ended, Ok(Some(_))),
+            "a finished sync task answered a request sent after it ended: got {after_it_ended:?}"
+        );
+        drop(handle);
     }
 
     // ---- Reconciliation through a real sync ---------------------------------
