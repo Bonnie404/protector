@@ -26,6 +26,10 @@ const TOKEN_ENDPOINT: &str = "https://oauth2.googleapis.com/token";
 
 /// How long `login` waits for the browser to come back before giving up.
 const CONSENT_TIMEOUT: StdDuration = StdDuration::from_secs(300);
+/// How long one accepted connection may take to send its request head. Separate
+/// from `CONSENT_TIMEOUT` on purpose: a peer that connects and stays silent must
+/// cost that peer's own task, never the login's remaining patience.
+const CONNECTION_READ_BUDGET: StdDuration = StdDuration::from_secs(30);
 /// How long any single Secret Service call may take before it is abandoned.
 const KEYRING_TIMEOUT: StdDuration = StdDuration::from_secs(10);
 /// The probe in `token_store` runs before the user has asked for anything, so
@@ -141,44 +145,82 @@ async fn read_request_head(stream: &mut tokio::net::TcpStream) -> anyhow::Result
     Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
+/// Answers one connection.
+///
+/// `None` means "this was not the redirect": a speculative preconnect that never
+/// says anything, a `/favicon.ico` fetch, a socket that errored. The login is not
+/// over — the real redirect may still be on its way — so the caller keeps waiting.
+async fn serve_connection(
+    mut stream: tokio::net::TcpStream,
+    expected_state: &str,
+) -> Option<anyhow::Result<String>> {
+    let request = tokio::time::timeout(CONNECTION_READ_BUDGET, read_request_head(&mut stream))
+        .await
+        .ok()? // Said nothing in time — give up on *this connection only*.
+        .ok()?; // Read error — likewise.
+    let is_callback = request
+        .split_whitespace()
+        .nth(1)
+        .map(|t| t.contains('?'))
+        .unwrap_or(false);
+    if !is_callback {
+        let _ = stream.write_all(http_response("404 Not Found", FAILURE_PAGE).as_bytes()).await;
+        let _ = stream.shutdown().await;
+        return None;
+    }
+    let result = parse_callback(&request, expected_state);
+    let page = if result.is_ok() { SUCCESS_PAGE } else { FAILURE_PAGE };
+    // The browser is told the outcome before the error propagates, so the user
+    // sees a page rather than a connection reset.
+    let _ = stream.write_all(http_response("200 OK", page).as_bytes()).await;
+    let _ = stream.shutdown().await;
+    Some(result)
+}
+
 /// Waits for the browser's redirect on an already-bound loopback listener and
 /// returns the authorization code.
 ///
-/// Connections that carry no query string at all — speculative preconnects,
-/// `/favicon.ico` — are answered with a 404 and do not consume the wait: the
-/// real redirect may well arrive on the second or third connection.
+/// Each connection is served by its own task, and that is not a refinement — it
+/// is the whole point. Browsers routinely open a speculative connection and then
+/// send nothing on it. Reading such a socket inline would park the single accept
+/// loop until the login-wide deadline expired, so the real redirect arriving on
+/// the *next* connection would never even be accepted. Handing every connection
+/// to a task keeps `accept()` free no matter what any one peer does.
 async fn accept_callback(
     listener: &tokio::net::TcpListener,
     expected_state: &str,
     wait: StdDuration,
 ) -> anyhow::Result<String> {
     let deadline = tokio::time::Instant::now() + wait;
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<anyhow::Result<String>>(4);
+    // Dropped — and so aborted — the moment this function returns, so a half-read
+    // socket can never outlive the login it belongs to.
+    let mut connections = tokio::task::JoinSet::new();
+
     loop {
-        let (mut stream, _) = tokio::time::timeout_at(deadline, listener.accept())
-            .await
-            .map_err(|_| anyhow::anyhow!("timed out waiting for the browser"))??;
-        let request = match tokio::time::timeout_at(deadline, read_request_head(&mut stream)).await {
-            Ok(Ok(r)) => r,
-            // A connection that opens and says nothing must not end the login.
-            Ok(Err(_)) | Err(_) => continue,
-        };
-        let is_callback = request
-            .split_whitespace()
-            .nth(1)
-            .map(|t| t.contains('?'))
-            .unwrap_or(false);
-        if !is_callback {
-            let _ = stream.write_all(http_response("404 Not Found", FAILURE_PAGE).as_bytes()).await;
-            let _ = stream.shutdown().await;
-            continue;
+        tokio::select! {
+            // Biased so that a code already in hand always beats the deadline
+            // arm: without it `select!` could pick the timeout at random on the
+            // very tick a successful callback landed.
+            biased;
+
+            // Whichever connection turns out to be the redirect settles it. The
+            // handler only sends after it has written the browser's reply, so by
+            // the time this fires the user already has their page.
+            Some(outcome) = rx.recv() => return outcome,
+
+            accepted = tokio::time::timeout_at(deadline, listener.accept()) => {
+                let (stream, _) = accepted
+                    .map_err(|_| anyhow::anyhow!("timed out waiting for the browser"))??;
+                let expected = expected_state.to_string();
+                let tx = tx.clone();
+                connections.spawn(async move {
+                    if let Some(outcome) = serve_connection(stream, &expected).await {
+                        let _ = tx.send(outcome).await;
+                    }
+                });
+            }
         }
-        let result = parse_callback(&request, expected_state);
-        let page = if result.is_ok() { SUCCESS_PAGE } else { FAILURE_PAGE };
-        // The browser is told the outcome before the error propagates, so the
-        // user sees a page rather than a connection reset.
-        let _ = stream.write_all(http_response("200 OK", page).as_bytes()).await;
-        let _ = stream.shutdown().await;
-        return result;
     }
 }
 
@@ -462,6 +504,37 @@ fn session_bus_present() -> bool {
         .unwrap_or(false)
 }
 
+/// Every store a refresh token could be sitting in on this machine.
+///
+/// `token_store()` picks *one*, and which one it picks can differ between runs:
+/// a login that fell back to the file because the keyring was locked, followed
+/// by a logout with the keyring reachable, would clear the keyring and leave a
+/// live credential in the file for good. So revocation and the single-copy
+/// invariant are both defined over this list, never over the selected store.
+///
+/// The keyring is listed only when a session bus exists, because without one it
+/// cannot hold anything. Constructing the entries touches no I/O.
+pub fn all_token_stores() -> Vec<Box<dyn TokenStore>> {
+    let mut stores: Vec<Box<dyn TokenStore>> = vec![Box::new(FileStore(token_file_path()))];
+    if session_bus_present() {
+        stores.push(Box::new(KeyringStore));
+    }
+    stores
+}
+
+/// Decided once per process. `guarded` spawns a thread per keyring call, and the
+/// probe costs up to `KEYRING_PROBE_TIMEOUT` against a locked collection — the
+/// sync loop must not pay either of those on every pass.
+static SELECTED_STORE: std::sync::OnceLock<Box<dyn TokenStore>> = std::sync::OnceLock::new();
+
+fn select_token_store() -> Box<dyn TokenStore> {
+    if session_bus_present() && KeyringStore::load_within(KEYRING_PROBE_TIMEOUT).is_ok() {
+        Box::new(KeyringStore)
+    } else {
+        Box::new(FileStore(token_file_path()))
+    }
+}
+
 /// Prefers the keyring; falls back to a 0600 file when Secret Service is absent
 /// or does not answer.
 ///
@@ -471,13 +544,10 @@ fn session_bus_present() -> bool {
 /// whose collection is locked will see their desktop's unlock dialog here; the
 /// watchdog in `guarded` bounds how long Protector waits for it.
 ///
-/// Blocking: call this from `tokio::task::spawn_blocking` in async code.
-pub fn token_store() -> Box<dyn TokenStore> {
-    if session_bus_present() && KeyringStore::load_within(KEYRING_PROBE_TIMEOUT).is_ok() {
-        Box::new(KeyringStore)
-    } else {
-        Box::new(FileStore(token_file_path()))
-    }
+/// Blocking on first call: reach it from `tokio::task::spawn_blocking` in async
+/// code. Later calls are free.
+pub fn token_store() -> &'static dyn TokenStore {
+    SELECTED_STORE.get_or_init(select_token_store).as_ref()
 }
 
 #[cfg(test)]
@@ -604,6 +674,27 @@ mod tests {
         let (noise, real) = browser.await.unwrap();
         assert!(noise.starts_with("HTTP/1.1 404 Not Found\r\n"), "noise: {noise:?}");
         assert_well_formed_http(&real);
+    }
+
+    #[tokio::test]
+    async fn a_silent_connection_does_not_block_the_real_callback() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        // A browser preconnect: the socket is opened and then says nothing at
+        // all, for as long as the browser feels like holding it. Served inline,
+        // this one connection would swallow the entire login-wide deadline and
+        // the real redirect below would never be accepted.
+        let preconnect = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let browser = tokio::spawn(async move {
+            send(port, "GET /?state=st8&code=ok HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n").await
+        });
+
+        let code = accept_callback(&listener, "st8", std::time::Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(code, "ok");
+        assert_well_formed_http(&browser.await.unwrap());
+        drop(preconnect);
     }
 
     #[tokio::test]
@@ -819,6 +910,25 @@ mod tests {
     #[test]
     fn a_file_store_says_how_it_stores_the_token() {
         assert!(FileStore(PathBuf::from("/tmp/x")).describe().contains("0600"));
+    }
+
+    /// Constructing the stores performs no I/O, so this never reaches the real
+    /// Secret Service; it pins the list `logout` revokes over and `login`
+    /// reconciles against.
+    #[test]
+    fn the_file_store_is_always_one_of_the_stores_logout_has_to_clear() {
+        let described: Vec<_> = all_token_stores().iter().map(|s| s.describe()).collect();
+        assert!(
+            described.contains(&FileStore(token_file_path()).describe()),
+            "a token stranded in the file store could never be revoked: {described:?}"
+        );
+        // `login` tells the selected store apart from the rest by `describe()`,
+        // and `logout` prints one line per entry, so duplicates would silently
+        // break both.
+        let mut unique = described.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), described.len(), "duplicate stores: {described:?}");
     }
 
     /// The keyring itself is deliberately never touched by the test suite: a

@@ -46,8 +46,8 @@ async fn main() {
 }
 
 /// Picking a token store touches the Secret Service, which blocks. Off the
-/// runtime thread it goes.
-async fn token_store() -> anyhow::Result<Box<dyn TokenStore>> {
+/// runtime thread it goes — once per process, then it is cached.
+async fn token_store() -> anyhow::Result<&'static dyn TokenStore> {
     Ok(tokio::task::spawn_blocking(auth::token_store).await?)
 }
 
@@ -80,18 +80,63 @@ async fn login() -> anyhow::Result<()> {
     })?;
     let store = token_store().await?;
     let where_ = store.describe();
-    tokio::task::spawn_blocking(move || store.save(&refresh)).await??;
+    let stale = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<&'static str>> {
+        store.save(&refresh)?;
+        // Exactly one copy may survive a login. An older token left in the store
+        // that was *not* selected this run stays valid at Google, is invisible to
+        // `status`, and would be missed by a later `logout` that happens to
+        // select the other store. Best effort: a keyring that will not answer
+        // must not fail a login that has already succeeded.
+        Ok(auth::all_token_stores()
+            .into_iter()
+            .filter(|other| other.describe() != where_)
+            .filter(|other| other.clear().is_err())
+            .map(|other| other.describe())
+            .collect())
+    })
+    .await??;
+
     println!("protector: connected. The refresh token is kept in the {where_}.");
+    for other in stale {
+        eprintln!("protector: warning — could not clear an older token from the {other}.");
+    }
     Ok(())
 }
 
 async fn logout() -> anyhow::Result<()> {
-    let store = token_store().await?;
-    let where_ = store.describe();
-    tokio::task::spawn_blocking(move || store.clear()).await??;
-    // Phrased as the end state rather than "removed": `clear()` is deliberately
-    // idempotent, so this same line is the truth whether or not there was one.
-    println!("protector: signed out — no refresh token is held in the {where_} any more.");
+    // Every store, not the one `token_store()` would select today: the token may
+    // well have been written by an earlier run that chose differently, and a
+    // revocation that silently misses it is worse than no revocation at all.
+    let outcomes = tokio::task::spawn_blocking(|| {
+        auth::all_token_stores()
+            .into_iter()
+            .map(|store| (store.describe(), store.clear()))
+            .collect::<Vec<_>>()
+    })
+    .await?;
+
+    let mut unrevoked = Vec::new();
+    for (where_, outcome) in &outcomes {
+        match outcome {
+            // Phrased as the end state rather than "removed": `clear()` is
+            // idempotent, so this is the truth whether or not there was one.
+            Ok(()) => println!("protector: no refresh token is held in the {where_} any more."),
+            Err(e) => {
+                eprintln!("protector: could not clear the {where_}: {e:#}");
+                unrevoked.push(*where_);
+            }
+        }
+    }
+    if !unrevoked.is_empty() {
+        anyhow::bail!(
+            "signed out of {} of {} stores. A refresh token may still be live in: {}. \
+             Revoke Protector at https://myaccount.google.com/permissions.",
+            outcomes.len() - unrevoked.len(),
+            outcomes.len(),
+            unrevoked.join(", ")
+        );
+    }
+    println!("protector: signed out.");
     println!("protector: Google still lists the app until you remove it at https://myaccount.google.com/permissions.");
     Ok(())
 }
