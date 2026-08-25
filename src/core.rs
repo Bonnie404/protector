@@ -1,7 +1,7 @@
 use chrono::{DateTime, Local};
 
 use crate::task::{panel_label, Selection, Task};
-use crate::tray::menu_model::{Action, MenuItem, MenuModel};
+use crate::tray::menu_model::{ids, Action, MenuItem, MenuModel, TaskIds};
 use crate::tray::UiState;
 
 #[derive(Debug, Clone)]
@@ -106,20 +106,30 @@ fn item_label(t: &Task) -> String {
     format!("{}   {} \u{2013} {}", t.title, t.start.format("%H:%M"), t.end.format("%H:%M"))
 }
 
-fn push_tasks(items: &mut Vec<MenuItem>, id: &mut i32, tasks: &[Task], selected_id: Option<&str>) {
+fn push_tasks(
+    items: &mut Vec<MenuItem>,
+    task_ids: &mut TaskIds,
+    tasks: &[Task],
+    selected_id: Option<&str>,
+) {
     for t in tasks {
         let checked = selected_id == Some(t.id.as_str());
-        items.push(MenuItem::radio(*id, &item_label(t), checked, Action::SelectTask(t.id.clone())));
-        *id += 1;
+        let id = task_ids.id_for(&t.id);
+        items.push(MenuItem::radio(id, &item_label(t), checked, Action::SelectTask(t.id.clone())));
     }
 }
 
 /// Turns the current `AppState` into what the panel should show. Pure: same
 /// inputs always produce the same `UiState`, so callers can derive as often as
 /// they like without side effects.
+///
+/// Every id here is derived from *what the item is* — a constant for the fixed
+/// items, a hash of the event id for the tasks — and never from its position
+/// in the list. See [`TaskIds`] for why: a DBusMenu `Event` carries no
+/// revision, so an id has to survive a rebuild with its meaning intact.
 pub fn derive_ui(state: &AppState, now: DateTime<Local>) -> UiState {
     let mut items = Vec::new();
-    let mut id = 1;
+    let mut task_ids = TaskIds::default();
     let selected_id = state.selection.as_ref().map(|s| s.task.id.as_str());
 
     if state.connected {
@@ -130,23 +140,19 @@ pub fn derive_ui(state: &AppState, now: DateTime<Local>) -> UiState {
             // that their day was free.
             let empty =
                 if state.synced { "Nothing scheduled today" } else { "Loading today\u{2026}" };
-            items.push(MenuItem::disabled(id, empty));
-            id += 1;
+            items.push(MenuItem::disabled(ids::EMPTY_DAY, empty));
         } else {
-            push_tasks(&mut items, &mut id, &state.tasks_now, selected_id);
+            push_tasks(&mut items, &mut task_ids, &state.tasks_now, selected_id);
             if !state.tasks_later.is_empty() {
                 if !state.tasks_now.is_empty() {
-                    items.push(MenuItem::separator(id));
-                    id += 1;
+                    items.push(MenuItem::separator(ids::LIST_SEPARATOR));
                 }
-                items.push(MenuItem::disabled(id, "Later today"));
-                id += 1;
-                push_tasks(&mut items, &mut id, &state.tasks_later, selected_id);
+                items.push(MenuItem::disabled(ids::LATER_HEADER, "Later today"));
+                push_tasks(&mut items, &mut task_ids, &state.tasks_later, selected_id);
             }
         }
     } else {
-        items.push(MenuItem::disabled(id, "Not connected"));
-        id += 1;
+        items.push(MenuItem::disabled(ids::NOT_CONNECTED, "Not connected"));
     }
 
     if state.last_error.is_some() {
@@ -154,21 +160,22 @@ pub fn derive_ui(state: &AppState, now: DateTime<Local>) -> UiState {
             .last_sync
             .map(|t| t.format("%H:%M").to_string())
             .unwrap_or_else(|| "never".into());
-        items.push(MenuItem::disabled(id, &format!("\u{26a0} Offline \u{2014} synced {synced}")));
-        id += 1;
+        items
+            .push(MenuItem::disabled(ids::OFFLINE, &format!("\u{26a0} Offline \u{2014} synced {synced}")));
     }
 
-    items.push(MenuItem::separator(id));
-    id += 1;
-    items.push(MenuItem::command(id, "Refresh now", Action::Refresh));
-    id += 1;
+    items.push(MenuItem::separator(ids::COMMAND_SEPARATOR));
+    items.push(MenuItem::command(ids::REFRESH, "Refresh now", Action::Refresh));
     if state.connected {
-        items.push(MenuItem::command(id, "Disconnect account", Action::Disconnect));
+        items.push(MenuItem::command(ids::DISCONNECT, "Disconnect account", Action::Disconnect));
     } else {
-        items.push(MenuItem::command(id, "Connect Google Calendar\u{2026}", Action::Connect));
+        items.push(MenuItem::command(
+            ids::CONNECT,
+            "Connect Google Calendar\u{2026}",
+            Action::Connect,
+        ));
     }
-    id += 1;
-    items.push(MenuItem::command(id, "Quit", Action::Quit));
+    items.push(MenuItem::command(ids::QUIT, "Quit", Action::Quit));
 
     let mut menu = MenuModel::new(items);
     // +1 so the very first change after startup (revision 0) is still an increase.
@@ -728,6 +735,136 @@ mod tests {
         // A counter that has run away for hours must still be a 5 minute wait,
         // not an overflow panic or a zero-length sleep that hammers the API.
         assert_eq!(backoff(u32::MAX).as_secs(), 300);
+    }
+
+    // ---- Menu ids ------------------------------------------------------------
+
+    /// The id the menu gives the item for `event`.
+    fn id_of(menu: &MenuModel, event: &str) -> i32 {
+        menu.items
+            .iter()
+            .find(|i| i.action == Action::SelectTask(event.into()))
+            .unwrap_or_else(|| panic!("{event} is not in the menu"))
+            .id
+    }
+
+    #[test]
+    fn deriving_the_same_menu_twice_gives_every_item_the_same_id() {
+        let state = connected_state();
+        let first: Vec<i32> = derive_ui(&state, at(14, 6)).menu.items.iter().map(|i| i.id).collect();
+        let again: Vec<i32> = derive_ui(&state, at(14, 6)).menu.items.iter().map(|i| i.id).collect();
+        assert_eq!(first, again);
+    }
+
+    #[test]
+    fn a_click_that_races_a_sync_still_selects_the_block_the_user_saw() {
+        // The hazard this closes: a DBusMenu `Event` carries no revision, so a
+        // host that has not re-fetched the layout clicks against the menu it
+        // last drew. With position-derived ids, a sync that dropped the first
+        // block renumbered everything below it, and "Deep work" selected
+        // whatever had taken its place.
+        let mut state = connected_state();
+        state.tasks_now = vec![
+            task("e1", "Design review", (14, 0), (15, 30)),
+            task("e2", "Deep work", (15, 30), (17, 0)),
+        ];
+        state.tasks_later = vec![task("e3", "Standup", (17, 30), (18, 0))];
+        // What the host was given, and what the user is looking at.
+        let published = derive_ui(&state, at(14, 6)).menu;
+        let clicked = id_of(&published, "e2");
+
+        // A sync lands while the menu is open: e1 has ended and dropped off
+        // the list, so every block below it shifts up a place. Position-derived
+        // ids handed e2's old id straight to e3.
+        state.tasks_now = vec![task("e2", "Deep work", (15, 30), (17, 0))];
+        state.tasks_later = vec![task("e3", "Standup", (17, 30), (18, 0))];
+        let fresh = derive_ui(&state, at(15, 40)).menu;
+
+        assert_eq!(
+            fresh.action_for(clicked),
+            Some(&Action::SelectTask("e2".into())),
+            "the click landed on a different block than the one it named"
+        );
+        assert_eq!(clicked, id_of(&fresh, "e2"), "the same event must keep its id across syncs");
+    }
+
+    #[test]
+    fn a_stale_connect_click_cannot_disconnect_a_freshly_connected_account() {
+        // The same reasoning applied to the one fixed item whose *meaning*
+        // changes: only one of Connect/Disconnect is ever listed, so they get
+        // ids of their own and a click on the vanished one resolves to nothing.
+        let mut state = connected_state();
+        state.connected = false;
+        let published = derive_ui(&state, at(14, 6)).menu;
+        let connect = published
+            .items
+            .iter()
+            .find(|i| i.action == Action::Connect)
+            .expect("a disconnected menu offers Connect")
+            .id;
+
+        state.connected = true;
+        let fresh = derive_ui(&state, at(14, 6)).menu;
+        assert_eq!(fresh.action_for(connect), None, "a stale Connect click must not disconnect");
+    }
+
+    #[test]
+    fn no_menu_item_claims_the_root_id_or_two_items_the_same_id() {
+        // `0` is the DBusMenu root; an item using it would be invisible to the
+        // host at best. Duplicates would make `action_for` answer one item's
+        // clicks with another's action.
+        let mut connected = connected_state();
+        connected.last_error = Some("timeout".into());
+        let mut empty = connected_state();
+        empty.tasks_now.clear();
+        empty.tasks_later.clear();
+        let mut disconnected = connected_state();
+        disconnected.connected = false;
+        let mut later_only = connected_state();
+        later_only.tasks_now.clear();
+
+        for state in [connected, empty, disconnected, later_only] {
+            let menu = derive_ui(&state, at(14, 6)).menu;
+            let mut seen = std::collections::HashSet::new();
+            for item in &menu.items {
+                assert_ne!(item.id, 0, "an item claimed the DBusMenu root: {:?}", item.label);
+                assert!(seen.insert(item.id), "two items share id {}", item.id);
+            }
+            // And the two ranges never overlap: a task id can never fire Quit.
+            for item in &menu.items {
+                let is_task = matches!(item.action, Action::SelectTask(_));
+                assert_eq!(
+                    is_task,
+                    item.id >= ids::FIRST_TASK,
+                    "{:?} is on the wrong side of FIRST_TASK with id {}",
+                    item.label,
+                    item.id
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn two_blocks_whose_ids_collide_are_still_separately_selectable() {
+        // Two event ids that really do hash to the same slot (see
+        // `menu_model`'s own test). The menu has to keep them apart.
+        let mut state = connected_state();
+        state.tasks_now = vec![
+            task("e39516", "Deep work", (14, 0), (15, 30)),
+            task("e64020", "Standup", (15, 30), (16, 0)),
+        ];
+        state.tasks_later.clear();
+        let menu = derive_ui(&state, at(14, 6)).menu;
+
+        let deep = id_of(&menu, "e39516");
+        let standup = id_of(&menu, "e64020");
+        assert_ne!(deep, standup);
+        assert_eq!(menu.action_for(deep), Some(&Action::SelectTask("e39516".into())));
+        assert_eq!(menu.action_for(standup), Some(&Action::SelectTask("e64020".into())));
+
+        // And clicking each one really does select that block, not its twin.
+        apply(&mut state, &menu.action_for(standup).cloned().unwrap());
+        assert_eq!(state.selection.as_ref().unwrap().task.id, "e64020");
     }
 
     #[test]

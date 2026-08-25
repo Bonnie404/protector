@@ -376,21 +376,22 @@ async fn run() -> anyhow::Result<()> {
     // The menu the host was last given. Every click is resolved against this
     // exact copy, never a freshly derived one.
     //
-    // What that buys: ids are stable *within a revision* (spec §5), and this
-    // is the most recent revision published, so resolving against it cannot
-    // be raced by a tick or a sync that renumbers the menu between the render
-    // and the click — which is exactly what re-deriving on every click would
-    // be.
+    // The guarantee that matters is no longer this copy's, though — it is the
+    // ids'. A DBusMenu `Event` carries no revision, so the host sends only an
+    // id, and a host whose menu is already open need not have re-fetched the
+    // layout since the last rebuild — while `AboutToShow` deliberately fires a
+    // sync at precisely that moment. Ids are therefore derived from *what an
+    // item is*, never from where it sits: a hash of the event id for tasks, a
+    // constant for each fixed item (`tray::menu_model::ids`). A block keeps
+    // its id across every sync that does not remove it, so a click that raced
+    // a rebuild still selects the block whose label the user was looking at,
+    // and an id whose block really is gone resolves to nothing.
     //
-    // What it does not buy: certainty that the host is looking at this
-    // revision. That would hold only for a host that re-fetches the layout on
-    // every `LayoutUpdated`, and one whose menu is already open may not —
-    // while `AboutToShow` deliberately fires a sync at precisely that moment.
-    // So a click can still arrive against a revision that has since been
-    // renumbered. That is why `MenuModel::action_for` returning `None`, and
-    // `Action::SelectTask` on an id no longer listed, are both quiet no-ops
-    // rather than errors. Content-derived ids would close the gap outright;
-    // it is recorded as a follow-up.
+    // Resolving against the published copy is still what makes the *labels*
+    // agree: it is the revision whose text the host is displaying, so the
+    // check mark and the task list a click is judged against are the ones on
+    // screen. `MenuModel::action_for` returning `None`, and
+    // `Action::SelectTask` on an id no longer listed, stay quiet no-ops.
     let mut published = derive_ui(&state, now);
     let (ui_tx, ui_rx) = tokio::sync::watch::channel(published.clone());
     let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::channel(32);
