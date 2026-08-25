@@ -120,7 +120,9 @@ pub fn task_slot(event_id: &str) -> i32 {
 ///
 /// Growth is one entry per distinct event id ever shown, and `calendar::fetch`
 /// asks for one day at a time with `maxResults=50`, so it is bounded by
-/// 50 a day: a few hundred entries a week, a few hundred kilobytes a year.
+/// 50 a day: a few hundred entries a week, and a couple of megabytes a year
+/// at that ceiling — far less in practice, since a real day holds nowhere
+/// near fifty distinct blocks.
 /// Nothing is evicted, deliberately — freeing an id is precisely how it would
 /// come to mean two different blocks, which is the bug this closes.
 #[derive(Debug, Default)]
@@ -325,7 +327,7 @@ mod tests {
         // or after any number of syncs, and it is the same id.
         assert_eq!(task_slot("e1"), task_slot("e1"));
         assert_ne!(task_slot("e1"), task_slot("e2"));
-        // And a `TaskIds` that has not seen the event before hands out exactly
+        // And a `TaskIdMemo` that has not seen the event before hands out exactly
         // that slot, whatever order the menu happens to list things in.
         assert_eq!(TaskIdMemo::default().id_for("e2"), task_slot("e2"));
     }
