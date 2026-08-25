@@ -1,10 +1,13 @@
+use std::sync::Arc;
+
 use chrono::Local;
 use protector::auth::{self, TokenStore};
 use protector::config;
 use protector::core::{apply, derive_ui, tick, AppState, Effect};
 use protector::state::{load, restore_selection, save, state_path, PersistedState};
-use protector::task::Task;
+use protector::sync;
 use protector::tray::{self, Command};
+use tokio::sync::mpsc;
 
 #[derive(clap::Parser)]
 #[command(name = "protector", version, about = "Calendar countdown in the GNOME panel")]
@@ -69,7 +72,22 @@ fn require_configured() -> anyhow::Result<config::Config> {
 async fn login() -> anyhow::Result<()> {
     let cfg = require_configured()?;
     println!("protector: opening Google's consent screen for read-only calendar access...");
-    let tokens = auth::login(&cfg).await?;
+    let (where_, stale) = connect_account(&cfg).await?;
+    println!("protector: connected. The refresh token is kept in the {where_}.");
+    for other in stale {
+        eprintln!("protector: warning — could not clear an older token from the {other}.");
+    }
+    Ok(())
+}
+
+/// Runs the OAuth flow and stores the refresh token. Returns where it was
+/// stored, plus any store that would not give up its older copy.
+///
+/// Shared by `protector login` and the menu's *Connect Google Calendar…*, so
+/// that connecting from the panel gets the same single-copy guarantee as
+/// connecting from a terminal.
+async fn connect_account(cfg: &config::Config) -> anyhow::Result<(&'static str, Vec<&'static str>)> {
+    let tokens = auth::login(cfg).await?;
     // Without a refresh token the widget would stop working in an hour, so this
     // is a failed login rather than a partial success.
     let refresh = tokens.refresh_token.ok_or_else(|| {
@@ -96,11 +114,7 @@ async fn login() -> anyhow::Result<()> {
     })
     .await??;
 
-    println!("protector: connected. The refresh token is kept in the {where_}.");
-    for other in stale {
-        eprintln!("protector: warning — could not clear an older token from the {other}.");
-    }
-    Ok(())
+    Ok((where_, stale))
 }
 
 async fn logout() -> anyhow::Result<()> {
@@ -180,21 +194,104 @@ async fn status() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Asks the sync task for an out-of-band sync, if there is one.
+///
+/// Never blocks and never fails: the channel holds one slot, so a full channel
+/// already carries a request for exactly what this call wanted, and no sync
+/// task at all means no account to sync.
+fn request_sync(handle: &Option<mpsc::Sender<()>>) {
+    if let Some(tx) = handle {
+        let _ = tx.try_send(());
+    }
+}
+
+/// Whether a refresh token is on file. Errors are reported and treated as "no",
+/// which lands the user on `Not connected` with a way to fix it, rather than on
+/// a widget that refuses to start.
+async fn has_stored_token(store: &Arc<dyn TokenStore>) -> bool {
+    let store = store.clone();
+    match tokio::task::spawn_blocking(move || store.load()).await {
+        Ok(Ok(token)) => token.is_some(),
+        Ok(Err(e)) => {
+            eprintln!("protector: could not read the token store: {e:#}");
+            false
+        }
+        Err(e) => {
+            eprintln!("protector: the token store lookup did not finish: {e}");
+            false
+        }
+    }
+}
+
+/// Handles *Connect Google Calendar…* from the menu, returning whether a flow
+/// is now waiting on the browser.
+///
+/// Without a client id there is no flow to start, so this opens `config.toml`
+/// instead of sending the user to a consent screen that would refuse them.
+/// With one, the flow waits on a browser for up to five minutes and so runs in
+/// a task of its own; the run loop hears about it as `Command::LoggedIn`.
+fn start_login(cfg: &config::Config, tx: mpsc::Sender<Command>) -> bool {
+    if !cfg.is_complete() {
+        let path = config::config_path();
+        eprintln!(
+            "protector: no Google OAuth client configured yet — fill in client_id and \
+             client_secret in {}",
+            path.display()
+        );
+        // Spawned and never awaited: on several desktops `xdg-open` does not
+        // return until the editor it launched exits.
+        let _ = tokio::process::Command::new("xdg-open").arg(&path).spawn();
+        return false;
+    }
+    let cfg = cfg.clone();
+    tokio::spawn(async move {
+        let outcome = connect_account(&cfg).await.map(|(where_, stale)| {
+            println!("protector: connected. The refresh token is kept in the {where_}.");
+            for other in stale {
+                eprintln!("protector: warning — could not clear an older token from the {other}.");
+            }
+        });
+        let _ = tx.send(Command::LoggedIn(outcome.map_err(|e| format!("{e:#}")))).await;
+    });
+    true
+}
+
+/// Clears every store rather than the selected one, for the same reason
+/// `logout` does: the live token may well have been written by a run that
+/// selected differently.
+fn forget_account() {
+    tokio::task::spawn_blocking(|| {
+        for store in auth::all_token_stores() {
+            if let Err(e) = store.clear() {
+                eprintln!("protector: could not clear the {}: {e:#}", store.describe());
+            }
+        }
+    });
+}
+
 async fn run() -> anyhow::Result<()> {
     // Fixed for the process lifetime: computed once so every `Effect::Persist`
     // in the run loop below writes to the same file `state_path()` names now.
     let state_file = state_path();
+    // Deliberately not `require_configured`: an unconfigured widget still
+    // starts and says `Not connected` in the panel, which is where a first-time
+    // user is looking, rather than exiting with a message they never see.
+    let cfg = config::load_or_create(&config::config_path())?;
+    let store = auth::shared_token_store();
 
-    let mut state = AppState { connected: true, ..Default::default() };
     let now = Local::now();
-    state.selection = restore_selection(&load(&state_file), now);
-    // Hardcoded until Task 8; proves the loop end to end.
-    state.tasks_now = vec![Task {
-        id: "e1".into(),
-        title: "Design review".into(),
-        start: now,
-        end: now + chrono::Duration::minutes(3),
-    }];
+    let persisted = load(&state_file);
+    let mut state = AppState {
+        selection: restore_selection(&persisted, now),
+        // Restored so a failed first sync can still say *when* the list it is
+        // showing was current.
+        last_sync: persisted.last_sync,
+        // Short-circuits on purpose: an empty config means no account no matter
+        // what is in the keyring, and asking would cost a Secret Service probe
+        // — and possibly an unlock dialog — for an answer already known.
+        connected: cfg.is_complete() && has_stored_token(&store).await,
+        ..Default::default()
+    };
 
     // The menu the host currently has. Every click is resolved against this
     // exact copy, never a freshly derived one: the host can only ever be
@@ -227,6 +324,19 @@ async fn run() -> anyhow::Result<()> {
         }
     });
 
+    // The sync task exists only while an account is connected. Without one
+    // there is nothing to fetch, and a timer failing every five minutes would
+    // only hang a `⚠ Offline` item under `Not connected`.
+    let mut sync_tx = state.connected.then(|| {
+        sync::spawn(sync::Syncer::new(cfg.clone(), store.clone()), cmd_tx.clone())
+    });
+    // Today's list, now, rather than in five minutes' time.
+    request_sync(&sync_tx);
+    // Nothing on screen moves while a login waits on the browser, so a second
+    // click on *Connect* is the natural thing for a user to do. Without this it
+    // would open a second consent tab on a second loopback port.
+    let mut login_in_flight = false;
+
     while let Some(cmd) = cmd_rx.recv().await {
         let now = Local::now();
         let effects = match cmd {
@@ -235,7 +345,43 @@ async fn run() -> anyhow::Result<()> {
                 Some(action) => apply(&mut state, &action),
                 None => vec![],
             },
-            Command::AboutToShow | Command::SecondaryActivate => vec![],
+            // The menu is about to be read, so this is the last moment a stale
+            // list can still be fixed — but not a reason to fetch again for
+            // someone flicking the menu open and shut.
+            Command::AboutToShow => {
+                if sync::is_stale(state.last_sync, now) {
+                    request_sync(&sync_tx);
+                }
+                vec![]
+            }
+            // Middle-click: the user asking outright.
+            Command::SecondaryActivate => {
+                request_sync(&sync_tx);
+                vec![]
+            }
+            // A sync still in flight when the account was disconnected must not
+            // repopulate the menu behind the user's back.
+            Command::Synced(result) if state.connected => sync::apply_sync(&mut state, result, now),
+            Command::Synced(_) => vec![],
+            Command::LoggedIn(Ok(())) => {
+                login_in_flight = false;
+                state.connected = true;
+                state.last_error = None;
+                state.revision += 1;
+                // Replacing the handle drops the previous sender, which ends
+                // any sync task left over from an earlier connection.
+                sync_tx = Some(sync::spawn(
+                    sync::Syncer::new(cfg.clone(), store.clone()),
+                    cmd_tx.clone(),
+                ));
+                request_sync(&sync_tx);
+                vec![]
+            }
+            Command::LoggedIn(Err(e)) => {
+                login_in_flight = false;
+                eprintln!("protector: connecting the account failed: {e}");
+                vec![]
+            }
         };
         // Checked as membership, not vector position, and always ahead of the
         // Quit check below: `Action::Quit` currently produces `[Effect::Quit]`
@@ -251,6 +397,22 @@ async fn run() -> anyhow::Result<()> {
             let snapshot = PersistedState::from_selection(state.selection.as_ref(), state.last_sync);
             if let Err(e) = save(&state_file, &snapshot) {
                 eprintln!("protector: failed to save state: {e:#}");
+            }
+        }
+        for effect in &effects {
+            match effect {
+                Effect::Sync => request_sync(&sync_tx),
+                Effect::StartLogin if login_in_flight => {
+                    eprintln!("protector: a connection attempt is already waiting for the browser.");
+                }
+                Effect::StartLogin => login_in_flight = start_login(&cfg, cmd_tx.clone()),
+                Effect::Logout => {
+                    // Dropping the handle ends the sync task; the account it
+                    // was syncing is about to stop existing.
+                    sync_tx = None;
+                    forget_account();
+                }
+                _ => {}
             }
         }
         if effects.contains(&Effect::Quit) {

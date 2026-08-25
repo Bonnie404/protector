@@ -23,6 +23,10 @@ pub enum Effect {
     Quit,
     NotifyWarning,
     NotifyEnded,
+    /// The selected event is gone from the calendar; the countdown it was
+    /// driving has been dropped and the user has to be told, since nothing on
+    /// screen would otherwise explain the label falling back to `Pick a task`.
+    NotifyRemoved,
     Persist,
 }
 
@@ -133,6 +137,10 @@ pub fn apply(state: &mut AppState, action: &Action) -> Vec<Effect> {
             state.selection = None;
             state.tasks_now.clear();
             state.tasks_later.clear();
+            // Leaving this set would hang a `⚠ Offline` item under
+            // `Not connected` for the rest of the session. Choosing to
+            // disconnect is not a failure to reach Google.
+            state.last_error = None;
             vec![Effect::Logout, Effect::Persist]
         }
         Action::Quit => vec![Effect::Quit],
@@ -158,6 +166,52 @@ pub fn tick(state: &mut AppState, now: DateTime<Local>) -> Vec<Effect> {
         }
     }
     effects
+}
+
+/// Folds a fresh event list into the selection.
+///
+/// Matching is by event id, never by position: the two lists are rebuilt from
+/// scratch on every sync, and a task that ended or was added shifts everything
+/// after it. An id is the only thing that still means the same event five
+/// minutes later.
+///
+/// Note what this does *not* touch: `tasks_now` and `tasks_later`. Replacing
+/// those is the caller's job (`sync::apply_sync`), because it is the caller
+/// that knows whether the fresh list arrived at all.
+pub fn reconcile(state: &mut AppState, fresh: &[Task]) -> Vec<Effect> {
+    state.revision += 1;
+    let mut effects = vec![Effect::Persist];
+    if let Some(sel) = state.selection.as_mut() {
+        match fresh.iter().find(|t| t.id == sel.task.id) {
+            Some(updated) => {
+                if updated.end != sel.task.end {
+                    // The block moved; the countdown follows it, and the
+                    // one-shot notifications get another chance. Left alone,
+                    // an event pushed back an hour would never warn again.
+                    sel.warned = false;
+                    sel.ended_notified = false;
+                }
+                sel.task = updated.clone();
+            }
+            None => {
+                state.selection = None;
+                effects.push(Effect::NotifyRemoved);
+            }
+        }
+    }
+    effects
+}
+
+/// How long to wait before retrying after `consecutive_failures` failed syncs:
+/// 30s, 60s, 120s, 240s, then 300s forever (spec §9).
+pub fn backoff(consecutive_failures: u32) -> std::time::Duration {
+    const BASE_SECS: u64 = 30;
+    const CEILING_SECS: u64 = 300;
+    // Clamped *before* the shift rather than after: `30u64 << 64` panics in a
+    // debug build, and a widget that has been offline all day is exactly the
+    // case that would reach it.
+    let doublings = consecutive_failures.min(4);
+    std::time::Duration::from_secs((BASE_SECS << doublings).min(CEILING_SECS))
 }
 
 #[cfg(test)]
@@ -269,6 +323,106 @@ mod tests {
         let second = tick(&mut state, at(15, 27));
         assert!(first.iter().any(|e| matches!(e, Effect::NotifyWarning)));
         assert!(!second.iter().any(|e| matches!(e, Effect::NotifyWarning)));
+    }
+
+    #[test]
+    fn disconnecting_clears_a_stale_offline_warning() {
+        let mut state = connected_state();
+        state.last_error = Some("the calendar did not answer within 30s".into());
+        apply(&mut state, &Action::Disconnect);
+        let ui = derive_ui(&state, at(14, 6));
+        assert!(
+            !ui.menu.items.iter().any(|i| i.label.starts_with("\u{26a0} Offline")),
+            "disconnecting on purpose is not the same as being offline: {:?}",
+            ui.menu.items.iter().map(|i| &i.label).collect::<Vec<_>>()
+        );
+    }
+
+    // ---- Reconciliation against a fresh sync --------------------------------
+
+    #[test]
+    fn a_moved_end_time_retargets_the_countdown() {
+        let mut state = connected_state();
+        apply(&mut state, &Action::SelectTask("e1".into()));
+        let moved = vec![task("e1", "Design review", (14, 0), (16, 0))];
+        reconcile(&mut state, &moved);
+        assert_eq!(state.selection.as_ref().unwrap().task.end, at(16, 0));
+    }
+
+    #[test]
+    fn a_moved_end_time_re_arms_the_one_shot_notifications() {
+        let mut state = connected_state();
+        apply(&mut state, &Action::SelectTask("e1".into()));
+        // The countdown ran out and both one-shots fired against the old end.
+        tick(&mut state, at(15, 31));
+        assert!(state.selection.as_ref().unwrap().ended_notified);
+        reconcile(&mut state, &[task("e1", "Design review", (14, 0), (16, 0))]);
+        let sel = state.selection.as_ref().unwrap();
+        assert!(!sel.warned, "the new end deserves its own warning");
+        assert!(!sel.ended_notified, "and its own end notification");
+    }
+
+    #[test]
+    fn a_deleted_event_clears_the_selection_and_says_so() {
+        let mut state = connected_state();
+        apply(&mut state, &Action::SelectTask("e1".into()));
+        let effects = reconcile(&mut state, &[task("e2", "Deep work", (15, 30), (17, 0))]);
+        assert!(state.selection.is_none());
+        assert!(effects.iter().any(|e| matches!(e, Effect::NotifyRemoved)));
+    }
+
+    #[test]
+    fn a_renamed_event_keeps_the_selection() {
+        let mut state = connected_state();
+        apply(&mut state, &Action::SelectTask("e1".into()));
+        reconcile(&mut state, &[task("e1", "Design review (moved)", (14, 0), (15, 30))]);
+        assert_eq!(state.selection.as_ref().unwrap().task.title, "Design review (moved)");
+    }
+
+    #[test]
+    fn an_unchanged_event_keeps_its_one_shot_flags() {
+        let mut state = connected_state();
+        apply(&mut state, &Action::SelectTask("e1".into()));
+        tick(&mut state, at(15, 26));
+        assert!(state.selection.as_ref().unwrap().warned);
+        reconcile(&mut state, &[task("e1", "Design review", (14, 0), (15, 30))]);
+        assert!(
+            state.selection.as_ref().unwrap().warned,
+            "a sync that changed nothing must not warn the user twice"
+        );
+    }
+
+    #[test]
+    fn reconciliation_matches_by_event_id_not_by_list_position() {
+        let mut state = connected_state();
+        apply(&mut state, &Action::SelectTask("e2".into()));
+        // e1 dropped off the front, so e2 is now the first entry.
+        reconcile(
+            &mut state,
+            &[task("e2", "Deep work", (15, 30), (17, 0)), task("e3", "Standup", (17, 30), (18, 0))],
+        );
+        assert_eq!(state.selection.as_ref().unwrap().task.id, "e2");
+    }
+
+    #[test]
+    fn a_sync_with_nothing_selected_is_harmless() {
+        let mut state = connected_state();
+        let effects = reconcile(&mut state, &[]);
+        assert!(state.selection.is_none());
+        assert!(!effects.iter().any(|e| matches!(e, Effect::NotifyRemoved)));
+    }
+
+    #[test]
+    fn backoff_grows_and_then_holds_at_five_minutes() {
+        assert_eq!(backoff(0).as_secs(), 30);
+        assert_eq!(backoff(1).as_secs(), 60);
+        assert_eq!(backoff(2).as_secs(), 120);
+        assert_eq!(backoff(3).as_secs(), 240);
+        assert_eq!(backoff(4).as_secs(), 300);
+        assert_eq!(backoff(9).as_secs(), 300);
+        // A counter that has run away for hours must still be a 5 minute wait,
+        // not an overflow panic or a zero-length sleep that hammers the API.
+        assert_eq!(backoff(u32::MAX).as_secs(), 300);
     }
 
     #[test]

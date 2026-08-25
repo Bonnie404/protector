@@ -22,7 +22,10 @@ use crate::config::Config;
 /// calendar: widening this is a security decision, not a convenience.
 pub const SCOPE: &str = "https://www.googleapis.com/auth/calendar.events.readonly";
 const AUTH_ENDPOINT: &str = "https://accounts.google.com/o/oauth2/v2/auth";
-const TOKEN_ENDPOINT: &str = "https://oauth2.googleapis.com/token";
+/// `pub(crate)` so `sync::Syncer` can hold it as its production default and
+/// swap in a mock server's address under test. Not `pub`: nothing outside this
+/// crate has any business pointing the token exchange somewhere else.
+pub(crate) const TOKEN_ENDPOINT: &str = "https://oauth2.googleapis.com/token";
 
 /// How long `login` waits for the browser to come back before giving up.
 const CONSENT_TIMEOUT: StdDuration = StdDuration::from_secs(300);
@@ -311,7 +314,11 @@ async fn exchange_code_at(
     .await
 }
 
-async fn refresh_at(cfg: &Config, refresh_token: &str, endpoint: &str) -> anyhow::Result<Tokens> {
+pub(crate) async fn refresh_at(
+    cfg: &Config,
+    refresh_token: &str,
+    endpoint: &str,
+) -> anyhow::Result<Tokens> {
     let mut tokens = post_token(
         endpoint,
         &[
@@ -548,6 +555,34 @@ fn select_token_store() -> Box<dyn TokenStore> {
 /// code. Later calls are free.
 pub fn token_store() -> &'static dyn TokenStore {
     SELECTED_STORE.get_or_init(select_token_store).as_ref()
+}
+
+/// A zero-sized handle to whatever `token_store()` selects, so the sync path can
+/// move a copy into each `spawn_blocking` call it makes. A `&'static dyn` cannot
+/// be moved into a `'static` closure that outlives the borrow it came from; an
+/// `Arc` can, and this one costs no allocation of its own beyond the `Arc`.
+///
+/// Constructing it is free: the selection — and its keyring probe — still
+/// happens on the first `save`/`load`/`clear`, inside whatever thread makes it.
+struct SelectedStore;
+
+impl TokenStore for SelectedStore {
+    fn save(&self, token: &str) -> anyhow::Result<()> {
+        token_store().save(token)
+    }
+    fn load(&self) -> anyhow::Result<Option<String>> {
+        token_store().load()
+    }
+    fn clear(&self) -> anyhow::Result<()> {
+        token_store().clear()
+    }
+    fn describe(&self) -> &'static str {
+        token_store().describe()
+    }
+}
+
+pub fn shared_token_store() -> std::sync::Arc<dyn TokenStore> {
+    std::sync::Arc::new(SelectedStore)
 }
 
 #[cfg(test)]

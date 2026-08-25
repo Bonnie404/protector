@@ -3,5 +3,6 @@ pub mod calendar;
 pub mod config;
 pub mod core;
 pub mod state;
+pub mod sync;
 pub mod task;
 pub mod tray;
