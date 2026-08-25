@@ -7,7 +7,7 @@
 //! the offending refresh token back inside `error_description`.
 
 use std::io::Write as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration as StdDuration;
 
 use base64::Engine;
@@ -475,6 +475,23 @@ impl TokenStore for KeyringStore {
 
 pub struct FileStore(pub PathBuf);
 
+impl FileStore {
+    /// Where `save` stages the token before renaming it into place. `clear`
+    /// has to know this path too, which is why it is named once here rather
+    /// than spelled out at both sites.
+    fn staging_path(&self) -> PathBuf {
+        self.0.with_extension("tmp")
+    }
+}
+
+fn remove_if_present(path: &Path) -> anyhow::Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
 impl TokenStore for FileStore {
     /// Written to a sibling temp file and renamed over the target, the same way
     /// `state::save` works. A truncate-then-write would turn a crash mid-save
@@ -484,7 +501,7 @@ impl TokenStore for FileStore {
         if let Some(parent) = self.0.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let tmp = self.0.with_extension("tmp");
+        let tmp = self.staging_path();
         // 0600 on the temp file too: the secret is in it from the first write,
         // so it must never exist as a world-readable file, not even briefly.
         let mut f = std::fs::OpenOptions::new()
@@ -515,12 +532,20 @@ impl TokenStore for FileStore {
             Err(e) => Err(e.into()),
         }
     }
+    /// Removes the staging file as well as the token itself.
+    ///
+    /// `save` writes the refresh token into `token.tmp` and only then renames
+    /// it over `token.json`; a crash in that window leaves a **live**
+    /// credential in the staging file that nothing else ever touches. Logout
+    /// promises to clear the token from every place it could be, and that is
+    /// one of the places.
+    ///
+    /// Both removals are attempted even when the first one fails, so a
+    /// permission problem on one cannot shield the other.
     fn clear(&self) -> anyhow::Result<()> {
-        match std::fs::remove_file(&self.0) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(e.into()),
-        }
+        let token = remove_if_present(&self.0);
+        let staged = remove_if_present(&self.staging_path());
+        token.and(staged)
     }
     fn describe(&self) -> &'static str {
         "file (0600)"
@@ -1131,6 +1156,28 @@ mod tests {
         let store = FileStore(dir.path().join("token.json"));
         std::fs::write(&store.0, "  \n").unwrap();
         assert!(store.load().unwrap().is_none());
+    }
+
+    /// A crash between `sync_all` and `rename` in `save` leaves the refresh
+    /// token in the staging file. `clear` — the one thing standing between a
+    /// disconnect and a live credential on disk — has to take that with it.
+    #[test]
+    fn clearing_a_file_store_removes_a_token_left_in_the_staging_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileStore(dir.path().join("token.json"));
+        let staged = store.staging_path();
+        // Exactly the state an interrupted `save` leaves behind.
+        std::fs::write(&staged, "live-refresh-token").unwrap();
+        store.save("another-live-token").unwrap();
+
+        store.clear().unwrap();
+
+        assert!(store.load().unwrap().is_none());
+        assert!(
+            !staged.exists(),
+            "a live refresh token survived logout in {}",
+            staged.display()
+        );
     }
 
     #[test]

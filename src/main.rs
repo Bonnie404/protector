@@ -292,8 +292,20 @@ impl Drop for LoginReport {
 /// Clears every store rather than the selected one, for the same reason
 /// `logout` does: the live token may well have been written by a run that
 /// selected differently.
-fn forget_account() {
-    tokio::task::spawn_blocking(|| {
+///
+/// `async fn` — and so `#[must_use]` at every call site — because awaiting it
+/// is the whole point. `Effect::Quit` ends the process with
+/// `std::process::exit`, which runs no destructors and waits for nothing, so a
+/// dropped `JoinHandle` here means *Disconnect account* followed by *Quit* can
+/// leave a live refresh token on disk while the panel says `Not connected`.
+/// On a locked keyring that window is `KEYRING_TIMEOUT` wide — ten seconds,
+/// exactly when the credential matters most.
+///
+/// The cost is that the run loop stops for as long as the clear takes, so the
+/// label can freeze for up to those ten seconds. That is the right way round:
+/// a frozen countdown is a cosmetic fault, a surviving credential is not.
+async fn forget_account() {
+    let cleared = tokio::task::spawn_blocking(|| {
         // `revoke_all_stores` bumps the write epoch under the same lock a token
         // write has to hold, so a sync attempt that is mid-rotation either
         // finishes before this clear — and is then cleared by it — or is
@@ -305,7 +317,11 @@ fn forget_account() {
                 eprintln!("protector: could not clear the {where_}: {e:#}");
             }
         }
-    });
+    })
+    .await;
+    if let Err(e) = cleared {
+        eprintln!("protector: the token clearing task did not finish: {e}");
+    }
 }
 
 async fn run() -> anyhow::Result<()> {
@@ -489,7 +505,8 @@ async fn run() -> anyhow::Result<()> {
                     // the clear had run, leaving a live credential behind an
                     // explicit disconnect.
                     drop(sync.take());
-                    forget_account();
+                    // Awaited, never spawned and forgotten: see `forget_account`.
+                    forget_account().await;
                 }
                 // `tick` never emits `NotifyWarning`/`NotifyEnded` without a
                 // selection in hand, so the `if let` below is not a silent
