@@ -585,6 +585,112 @@ pub fn shared_token_store() -> std::sync::Arc<dyn TokenStore> {
     std::sync::Arc::new(SelectedStore)
 }
 
+/// Serialises every write to the token store against revocation.
+///
+/// Cancellation cannot do this job, and it is worth being explicit about why:
+/// `tokio::task::spawn_blocking` runs a closure it has already dispatched to
+/// completion no matter what becomes of its `JoinHandle`, and `KeyringStore`
+/// puts a second raw `std::thread` behind that again — one whose own watchdog
+/// admits it can outlive its budget while a desktop prompt is pending. So by
+/// the time a sync's rotated-token write is on its way, nothing can call it
+/// back, and a "Disconnect account" landing in that window would be undone by
+/// a credential written after it.
+///
+/// The two operations take turns instead. Every write states the epoch it
+/// began in; every revocation bumps the epoch under the same lock the write
+/// must hold. A write whose epoch is stale is dropped rather than applied, and
+/// a write already in progress finishes *before* the clear that follows it —
+/// so there is no interleaving in which a live token survives a revocation.
+pub struct TokenWrites {
+    lock: std::sync::Mutex<()>,
+    epoch: std::sync::atomic::AtomicU64,
+}
+
+impl Default for TokenWrites {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl TokenWrites {
+    pub fn new() -> Self {
+        Self { lock: std::sync::Mutex::new(()), epoch: std::sync::atomic::AtomicU64::new(0) }
+    }
+
+    /// The epoch a write beginning now belongs to.
+    ///
+    /// Deliberately lock-free: this is read from async code, where waiting on a
+    /// keyring write that may hold the lock for ten seconds would park a
+    /// runtime worker thread.
+    pub fn epoch(&self) -> u64 {
+        self.epoch.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// A poisoned lock is no reason to strand the token store: what it guards
+    /// is one counter, and every path that touches it leaves it consistent.
+    fn enter(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn bump(&self) {
+        self.epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Writes `token` unless something has superseded it since `epoch` — a
+    /// disconnect, or a newer login. Returns whether it wrote.
+    ///
+    /// The check and the write are one critical section on purpose: a check
+    /// outside the lock would reintroduce the same race in miniature.
+    ///
+    /// Blocking; call it from `spawn_blocking`.
+    pub fn save_unless_revoked(
+        &self,
+        store: &dyn TokenStore,
+        token: &str,
+        epoch: u64,
+    ) -> anyhow::Result<bool> {
+        let _guard = self.enter();
+        if self.epoch() != epoch {
+            return Ok(false);
+        }
+        store.save(token)?;
+        Ok(true)
+    }
+
+    /// Writes a newly issued token, invalidating every write that began before
+    /// it. Blocking.
+    pub fn install(&self, store: &dyn TokenStore, token: &str) -> anyhow::Result<()> {
+        let _guard = self.enter();
+        self.bump();
+        store.save(token)
+    }
+
+    /// Clears every store on this machine and invalidates every write that
+    /// began before now. Blocking. One outcome per store, in `all_token_stores`
+    /// order.
+    pub fn revoke_all_stores(&self) -> Vec<(&'static str, anyhow::Result<()>)> {
+        let _guard = self.enter();
+        self.bump();
+        all_token_stores().into_iter().map(|s| (s.describe(), s.clear())).collect()
+    }
+
+    /// Invalidates every write that began before now, without clearing
+    /// anything. Blocking.
+    pub fn invalidate(&self) {
+        let _guard = self.enter();
+        self.bump();
+    }
+}
+
+static TOKEN_WRITES: std::sync::OnceLock<std::sync::Arc<TokenWrites>> = std::sync::OnceLock::new();
+
+/// The process-wide guard. Every token write the running widget performs goes
+/// through this one instance; tests use instances of their own, so that no test
+/// can invalidate another's write.
+pub fn token_writes() -> std::sync::Arc<TokenWrites> {
+    TOKEN_WRITES.get_or_init(|| std::sync::Arc::new(TokenWrites::new())).clone()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -964,6 +1070,69 @@ mod tests {
         unique.sort_unstable();
         unique.dedup();
         assert_eq!(unique.len(), described.len(), "duplicate stores: {described:?}");
+    }
+
+    // ---- Serialising token writes against revocation ------------------------
+
+    /// Every test here uses its own `TokenWrites`, never `token_writes()`: a
+    /// shared epoch would let one test invalidate another's write.
+    #[test]
+    fn a_write_that_began_before_a_revocation_is_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileStore(dir.path().join("token.json"));
+        let writes = TokenWrites::new();
+
+        let epoch = writes.epoch();
+        // "Disconnect account", while the write above is still in flight.
+        writes.invalidate();
+        assert!(!writes.save_unless_revoked(&store, "1//rotated", epoch).unwrap());
+        assert_eq!(store.load().unwrap(), None, "a revoked account kept a live token");
+
+        // A write that began after it is applied as normal.
+        let epoch = writes.epoch();
+        assert!(writes.save_unless_revoked(&store, "1//fresh", epoch).unwrap());
+        assert_eq!(store.load().unwrap().as_deref(), Some("1//fresh"));
+    }
+
+    #[test]
+    fn installing_a_newer_token_invalidates_a_write_that_began_before_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileStore(dir.path().join("token.json"));
+        let writes = TokenWrites::new();
+
+        // A sync begins an attempt, then the user reconnects the account.
+        let epoch = writes.epoch();
+        writes.install(&store, "1//from-the-new-login").unwrap();
+        // The older attempt's rotation must not overwrite the newer credential.
+        assert!(!writes.save_unless_revoked(&store, "1//from-the-old-account", epoch).unwrap());
+        assert_eq!(store.load().unwrap().as_deref(), Some("1//from-the-new-login"));
+    }
+
+    #[test]
+    fn a_revocation_waits_for_a_write_that_is_already_under_way() {
+        // The ordering that matters: the clear cannot begin while a write holds
+        // the lock, so it can never be overtaken by the write it was meant to
+        // undo. Proven here with the lock alone, no store involved.
+        use std::sync::Arc;
+        let writes = Arc::new(TokenWrites::new());
+        let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let started = writes.clone();
+        let started_order = order.clone();
+        let holder = std::thread::spawn(move || {
+            let guard = started.enter();
+            started_order.lock().unwrap().push("write begins");
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            started_order.lock().unwrap().push("write ends");
+            drop(guard);
+        });
+        // Long enough that the revocation below is genuinely queued behind it.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        writes.invalidate();
+        order.lock().unwrap().push("revocation");
+        holder.join().unwrap();
+
+        assert_eq!(*order.lock().unwrap(), vec!["write begins", "write ends", "revocation"]);
     }
 
     /// The keyring itself is deliberately never touched by the test suite: a

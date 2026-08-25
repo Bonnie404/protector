@@ -13,7 +13,7 @@ use std::time::Duration;
 use chrono::{DateTime, Local};
 use tokio::sync::mpsc;
 
-use crate::auth::{self, TokenStore, Tokens};
+use crate::auth::{self, TokenStore, TokenWrites, Tokens};
 use crate::calendar;
 use crate::config::Config;
 use crate::core::{backoff, reconcile, AppState, Effect};
@@ -59,6 +59,8 @@ pub struct Syncer {
     /// The current access token, or `None` before the first refresh.
     tokens: Option<Tokens>,
     request_timeout: Duration,
+    /// Guards this syncer's token writes against a concurrent disconnect.
+    writes: Arc<TokenWrites>,
 }
 
 impl Syncer {
@@ -84,6 +86,7 @@ impl Syncer {
             token_endpoint,
             tokens: None,
             request_timeout: REQUEST_TIMEOUT,
+            writes: auth::token_writes(),
         }
     }
 
@@ -106,7 +109,11 @@ impl Syncer {
     /// Fetches today's tasks, refreshing the access token first if it is
     /// missing or expired, and once more if the API answers 401.
     async fn attempt(&mut self, now: DateTime<Local>) -> anyhow::Result<Vec<Task>> {
-        let access = self.access_token(now).await?;
+        // The epoch this attempt belongs to. A disconnect (or a newer login)
+        // between here and any write below turns that write into a no-op
+        // instead of a credential resurrected after its revocation.
+        let epoch = self.writes.epoch();
+        let access = self.access_token(now, epoch).await?;
 
         // Everything the retry closure needs, owned outright: it has to be
         // `'static`, and `self` is borrowed immutably for the length of the
@@ -117,6 +124,7 @@ impl Syncer {
         let cfg = self.cfg.clone();
         let endpoint = self.token_endpoint.clone();
         let store = self.store.clone();
+        let writes = self.writes.clone();
         // Resolved inside the closure, so a sync that never sees a 401 never
         // touches the token store — which on this desktop may mean a Secret
         // Service round trip, or a locked collection that answers with an error.
@@ -130,7 +138,7 @@ impl Syncer {
                     Some(token) => token,
                     None => stored_refresh_token(&store).await?,
                 };
-                let tokens = refreshed(&cfg, &endpoint, &store, &refresh_token).await?;
+                let tokens = refreshed(&cfg, &endpoint, &store, &writes, &refresh_token, epoch).await?;
                 let access = tokens.access_token.clone();
                 *out.lock().expect("the refresh mutex is never held across a panic") = Some(tokens);
                 Ok(access)
@@ -148,12 +156,14 @@ impl Syncer {
 
     /// The access token to use for a request starting at `now`, minting one if
     /// the cached token is missing or has expired.
-    async fn access_token(&mut self, now: DateTime<Local>) -> anyhow::Result<String> {
+    async fn access_token(&mut self, now: DateTime<Local>, epoch: u64) -> anyhow::Result<String> {
         if let Some(t) = self.tokens.as_ref().filter(|t| t.expires_at > now) {
             return Ok(t.access_token.clone());
         }
         let refresh_token = self.refresh_token().await?;
-        let tokens = refreshed(&self.cfg, &self.token_endpoint, &self.store, &refresh_token).await?;
+        let tokens =
+            refreshed(&self.cfg, &self.token_endpoint, &self.store, &self.writes, &refresh_token, epoch)
+                .await?;
         let access = tokens.access_token.clone();
         self.tokens = Some(tokens);
         Ok(access)
@@ -187,7 +197,9 @@ async fn refreshed(
     cfg: &Config,
     endpoint: &str,
     store: &Arc<dyn TokenStore>,
+    writes: &Arc<TokenWrites>,
     refresh_token: &str,
+    epoch: u64,
 ) -> anyhow::Result<Tokens> {
     let tokens = auth::refresh_at(cfg, refresh_token, endpoint).await?;
     // `refresh_at` carries the old token forward when the response omits one,
@@ -195,7 +207,9 @@ async fn refreshed(
     // not optional: the copy on disk is the only one that survives a restart,
     // and the old one stops working the moment the new one is issued.
     match tokens.refresh_token.as_deref() {
-        Some(fresh) if fresh != refresh_token => save_refresh_token(store, fresh).await?,
+        Some(fresh) if fresh != refresh_token => {
+            save_refresh_token(store, writes, fresh, epoch).await?
+        }
         _ => {}
     }
     Ok(tokens)
@@ -209,10 +223,31 @@ async fn load_refresh_token(store: &Arc<dyn TokenStore>) -> anyhow::Result<Optio
     tokio::task::spawn_blocking(move || store.load()).await?
 }
 
-async fn save_refresh_token(store: &Arc<dyn TokenStore>, token: &str) -> anyhow::Result<()> {
+/// Persists a rotated refresh token, unless the account was disconnected while
+/// this attempt was in flight.
+///
+/// Nothing can cancel this once it is dispatched — that is the whole reason the
+/// epoch exists — so the decision to write is taken inside the blocking closure,
+/// under the same lock a revocation has to hold.
+async fn save_refresh_token(
+    store: &Arc<dyn TokenStore>,
+    writes: &Arc<TokenWrites>,
+    token: &str,
+    epoch: u64,
+) -> anyhow::Result<()> {
     let store = store.clone();
+    let writes = writes.clone();
     let token = token.to_string();
-    tokio::task::spawn_blocking(move || store.save(&token)).await?
+    let wrote =
+        tokio::task::spawn_blocking(move || writes.save_unless_revoked(&*store, &token, epoch))
+            .await??;
+    if !wrote {
+        // Dropping it is the correct outcome, not a failure: the user asked for
+        // there to be no stored credential, and Google retired the old one the
+        // moment it issued this.
+        eprintln!("protector: discarded a refreshed token — the account was disconnected mid-sync.");
+    }
+    Ok(())
 }
 
 /// Folds a sync outcome into the state, returning the effects it produced.
@@ -266,12 +301,17 @@ fn out_of_window(state: &AppState, fresh: &[Task], now: DateTime<Local>) -> bool
 
 /// A running sync task.
 ///
-/// Dropping this stops the task **now**, not at the end of whatever it is
-/// doing. Closing the request channel alone would only end the loop between
-/// attempts, and an attempt can be up to `REQUEST_TIMEOUT` long — long enough
-/// for a 401 retry to rotate the refresh token and write it to the store
-/// *after* a "Disconnect account" has already cleared it, leaving a live
-/// credential behind an explicit revocation. The abort closes that window.
+/// Dropping this aborts the task, rather than merely closing its request
+/// channel: closing the channel alone would end the loop only *between*
+/// attempts, and one attempt can run for `REQUEST_TIMEOUT`.
+///
+/// The abort reaches the task's own control flow at its next await point, and
+/// no further than that. Work already handed to `tokio::task::spawn_blocking`
+/// — which is how every token-store write is made — runs to completion
+/// regardless, so this is emphatically **not** a guarantee that nothing more
+/// will be written after the drop. What guarantees that is `auth::TokenWrites`:
+/// a write dispatched before a revocation either lands before the clear that
+/// follows it, or is dropped for being a generation behind.
 pub struct SyncHandle {
     requests: mpsc::Sender<()>,
     task: tokio::task::JoinHandle<()>,
@@ -375,7 +415,52 @@ mod tests {
     }
 
     fn syncer(server: &MockServer, store: Arc<dyn TokenStore>) -> Syncer {
-        Syncer::with_endpoints(cfg(), store, server.uri(), format!("{}/token", server.uri()))
+        syncer_guarded(server, store, Arc::new(TokenWrites::new()))
+    }
+
+    /// A syncer whose token writes are guarded by `writes`. Tests always pass an
+    /// instance of their own rather than `auth::token_writes()`: on the shared
+    /// guard, one test's revocation would invalidate another's write.
+    fn syncer_guarded(
+        server: &MockServer,
+        store: Arc<dyn TokenStore>,
+        writes: Arc<TokenWrites>,
+    ) -> Syncer {
+        let mut s =
+            Syncer::with_endpoints(cfg(), store, server.uri(), format!("{}/token", server.uri()));
+        s.writes = writes;
+        s
+    }
+
+    /// A store whose `save` parks until the test lets it through, so a write can
+    /// be held open across the exact instant a disconnect lands. What is being
+    /// pinned is the ordering between clear and save, not the storage backend.
+    struct BlockingStore {
+        inner: FileStore,
+        entered: tokio::sync::mpsc::Sender<()>,
+        release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+        landed: tokio::sync::mpsc::Sender<()>,
+    }
+
+    impl TokenStore for BlockingStore {
+        fn save(&self, token: &str) -> anyhow::Result<()> {
+            let _ = self.entered.try_send(());
+            let _ = self.release.lock().expect("no panic holds this").recv();
+            let outcome = self.inner.save(token);
+            // Announced *after* the bytes are down, so the assertion can never
+            // win by outrunning the write it is meant to catch.
+            let _ = self.landed.try_send(());
+            outcome
+        }
+        fn load(&self) -> anyhow::Result<Option<String>> {
+            self.inner.load()
+        }
+        fn clear(&self) -> anyhow::Result<()> {
+            self.inner.clear()
+        }
+        fn describe(&self) -> &'static str {
+            "blocking test store"
+        }
     }
 
     /// The token endpoint, answering once with `body`.
@@ -655,6 +740,96 @@ mod tests {
             store.load().unwrap(),
             None,
             "a rotated refresh token was written after the account was disconnected"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_logout_during_the_write_itself_still_leaves_no_token_behind() {
+        // The sub-case an abort cannot touch: the token response has *landed*,
+        // the rotated token is already on its way to the store, and only then
+        // does the user choose "Disconnect account". `spawn_blocking` runs a
+        // dispatched closure to completion regardless of its handle, so nothing
+        // can call that write back — the guard has to serialise it instead.
+        let server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let (entered_tx, mut entered) = tokio::sync::mpsc::channel(1);
+        let (release, release_rx) = std::sync::mpsc::channel();
+        let (landed_tx, mut landed) = tokio::sync::mpsc::channel(1);
+        // Seeded through a plain `FileStore` on the same path: routing it
+        // through the blocking one would park the test itself, and would burn
+        // the `entered` signal the write under test has to deliver.
+        let token_path = dir.path().join("token.json");
+        FileStore(token_path.clone()).save("1//stored").unwrap();
+        let store: Arc<dyn TokenStore> = Arc::new(BlockingStore {
+            inner: FileStore(token_path),
+            entered: entered_tx,
+            release: std::sync::Mutex::new(release_rx),
+            landed: landed_tx,
+        });
+
+        mock_events(&server, "ya29.stale", ResponseTemplate::new(401)).await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "ya29.fresh",
+                "refresh_token": "1//rotated",
+                "expires_in": 3599,
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/calendars/primary/events"))
+            .and(header("authorization", "Bearer ya29.fresh"))
+            .respond_with(fixture())
+            .mount(&server)
+            .await;
+
+        let writes = Arc::new(TokenWrites::new());
+        let mut s = syncer_guarded(&server, store.clone(), writes.clone());
+        s.tokens = Some(Tokens {
+            access_token: "ya29.stale".into(),
+            refresh_token: Some("1//stored".into()),
+            expires_at: Local::now() + chrono::Duration::hours(1),
+        });
+        let (cmd_tx, _cmd_rx) = mpsc::channel(4);
+        let handle = spawn(s, cmd_tx);
+        handle.request();
+
+        // The rotated token is now inside `store.save`, parked, holding the
+        // write lock. No abort can reach it.
+        entered.recv().await.expect("the rotated token reached the store");
+        drop(handle);
+
+        // Exactly what `Effect::Logout` does, on a blocking thread as it would
+        // be in the widget: it has to queue behind the write already under way.
+        let (started_tx, mut started) = tokio::sync::mpsc::channel(1);
+        let logout = tokio::task::spawn_blocking({
+            let writes = writes.clone();
+            let store = store.clone();
+            move || {
+                let _ = started_tx.try_send(());
+                writes.invalidate();
+                store.clear().unwrap();
+            }
+        });
+        started.recv().await.expect("the disconnect is under way");
+        // Deliberate: this hands an *unguarded* implementation every chance to
+        // finish clearing before the write is released, which is exactly the
+        // interleaving that used to lose the revocation. Under the guard the
+        // disconnect is parked on the lock and this changes nothing, so the
+        // assertion below holds on timing grounds for a broken implementation
+        // and on ordering grounds for a correct one.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        release.send(()).unwrap();
+        // The write has now finished, one way or the other. Under the guard the
+        // disconnect is still queued behind it and only clears after this.
+        landed.recv().await.expect("the write completed");
+        logout.await.unwrap();
+
+        assert_eq!(
+            store.load().unwrap(),
+            None,
+            "a rotated refresh token outlived the disconnect that was meant to revoke it"
         );
     }
 

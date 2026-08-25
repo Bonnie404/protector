@@ -99,7 +99,9 @@ async fn connect_account(cfg: &config::Config) -> anyhow::Result<(&'static str, 
     let store = token_store().await?;
     let where_ = store.describe();
     let stale = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<&'static str>> {
-        store.save(&refresh)?;
+        // Installed through the guard: any token write still in flight from an
+        // earlier connection is a generation behind this one and is discarded.
+        auth::token_writes().install(store, &refresh)?;
         // Exactly one copy may survive a login. An older token left in the store
         // that was *not* selected this run stays valid at Google, is invisible to
         // `status`, and would be missed by a later `logout` that happens to
@@ -121,13 +123,7 @@ async fn logout() -> anyhow::Result<()> {
     // Every store, not the one `token_store()` would select today: the token may
     // well have been written by an earlier run that chose differently, and a
     // revocation that silently misses it is worse than no revocation at all.
-    let outcomes = tokio::task::spawn_blocking(|| {
-        auth::all_token_stores()
-            .into_iter()
-            .map(|store| (store.describe(), store.clear()))
-            .collect::<Vec<_>>()
-    })
-    .await?;
+    let outcomes = tokio::task::spawn_blocking(|| auth::token_writes().revoke_all_stores()).await?;
 
     let mut unrevoked = Vec::new();
     for (where_, outcome) in &outcomes {
@@ -296,9 +292,15 @@ impl Drop for LoginReport {
 /// selected differently.
 fn forget_account() {
     tokio::task::spawn_blocking(|| {
-        for store in auth::all_token_stores() {
-            if let Err(e) = store.clear() {
-                eprintln!("protector: could not clear the {}: {e:#}", store.describe());
+        // `revoke_all_stores` bumps the write epoch under the same lock a token
+        // write has to hold, so a sync attempt that is mid-rotation either
+        // finishes before this clear — and is then cleared by it — or is
+        // discarded for being a generation behind. Aborting the sync task
+        // cannot achieve that: a dispatched `spawn_blocking` write runs to
+        // completion whatever happens to its handle.
+        for (where_, outcome) in auth::token_writes().revoke_all_stores() {
+            if let Err(e) = outcome {
+                eprintln!("protector: could not clear the {where_}: {e:#}");
             }
         }
     });
