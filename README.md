@@ -176,14 +176,17 @@ revoke endpoint.
 
 ## Uninstalling
 
+Run these in order — logout has to happen while the binary still exists,
+and before the unit that might restart it is gone:
+
 ```sh
 systemctl --user disable --now protector.service   # if you had enabled it
+protector logout                                   # clears the stored token
 rm ~/.local/bin/protector
 rm ~/.local/share/icons/hicolor/scalable/apps/protector.svg
 rm ~/.local/share/icons/hicolor/scalable/apps/protector-attention.svg
 rm ~/.config/systemd/user/protector.service
 systemctl --user daemon-reload
-protector logout   # before removing the binary, to clear the stored token
 ```
 
 `~/.config/protector/config.toml` and `~/.local/state/protector/` are left
