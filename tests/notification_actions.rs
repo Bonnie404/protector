@@ -179,6 +179,51 @@ async fn notify_ended_with_nothing_scheduled_offers_only_the_dismiss_button() {
 }
 
 #[tokio::test]
+async fn a_title_with_markup_characters_reaches_the_wire_escaped_in_the_body_but_raw_on_the_button() {
+    let bus = private_bus();
+    let (_server, client, calls) = fake_server(&bus).await;
+
+    let ended = task("e1", "Design review", 14, 0);
+    let candidates = vec![
+        task("e2", "Deep work", 15, 30),
+        task("e3", "Standup", 17, 30),
+        task("e4", "Email", 18, 0),
+        // The fourth candidate lands in the body text, not a button — this is
+        // the path that goes through a Pango markup parser.
+        task("e5", "Q&A <planning>", 19, 0),
+    ];
+
+    notify::notify_ended(&client, &ended, &candidates).await.unwrap();
+
+    let calls = calls.lock().unwrap();
+    let call = &calls[0];
+    assert!(
+        call.body.contains("Q&amp;A &lt;planning&gt; 19:00"),
+        "unescaped markup characters reached the real Notify call's body: {:?}",
+        call.body
+    );
+    assert!(!call.body.contains("Q&A <planning>"), "the raw title leaked into the body: {:?}", call.body);
+}
+
+#[tokio::test]
+async fn a_title_with_markup_characters_on_a_button_stays_exactly_as_calendar_sent_it() {
+    let bus = private_bus();
+    let (_server, client, calls) = fake_server(&bus).await;
+
+    let ended = task("e1", "Design review", 14, 0);
+    // Within the first three, so it becomes a button label rather than body
+    // text — action labels are not parsed as markup, so escaping them would
+    // corrupt what the user sees on the button.
+    let candidates = vec![task("e2", "Q&A <planning>", 15, 30)];
+
+    notify::notify_ended(&client, &ended, &candidates).await.unwrap();
+
+    let calls = calls.lock().unwrap();
+    let call = &calls[0];
+    assert_eq!(call.actions[1], "Q&A <planning> 15:30", "a button label must not be escaped");
+}
+
+#[tokio::test]
 async fn notify_warning_is_low_urgency_with_no_actions_and_expires_normally() {
     let bus = private_bus();
     let (_server, client, calls) = fake_server(&bus).await;

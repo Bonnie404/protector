@@ -48,6 +48,24 @@ fn button_label(t: &Task) -> String {
     format!("{} {}", t.title, t.start.format("%H:%M"))
 }
 
+/// Escapes the three characters that matter to a Pango markup parser — `&`
+/// first, so it cannot re-escape the entities this function just introduced,
+/// then `<` and `>`. Every task title reaching the notification **body**
+/// goes through this: titles come straight from Google Calendar's `summary`
+/// field (`calendar.rs`), are otherwise unescaped, and this session's own
+/// `GetCapabilities` advertises `body-markup`, so the body is parsed as
+/// markup rather than shown literally. `&`, `<`, `>` are the only characters
+/// that matter to that parser; nothing else needs touching.
+///
+/// Deliberately *not* applied to action labels (`ended_actions`/
+/// `button_label`'s use in them): the Desktop Notifications spec does not
+/// parse action labels as markup, so escaping them would corrupt the visible
+/// button text (`Q&A` would show as the literal characters `Q&amp;A`)
+/// instead of protecting anything.
+fn escape_markup(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+}
+
 /// The `Notify` `actions` array for the end-of-task chooser: alternating
 /// `(action_key, localized_label)` pairs, one per candidate up to
 /// [`MAX_BUTTONS`], plus a trailing `none` / `Nothing` pair so there is
@@ -69,7 +87,8 @@ pub fn ended_body(candidates: &[Task]) -> String {
     if candidates.is_empty() {
         return "Nothing else is scheduled today.".into();
     }
-    let rest: Vec<String> = candidates.iter().skip(MAX_BUTTONS).map(button_label).collect();
+    let rest: Vec<String> =
+        candidates.iter().skip(MAX_BUTTONS).map(|t| escape_markup(&button_label(t))).collect();
     if rest.is_empty() {
         "Pick what you are working on next.".into()
     } else {
@@ -188,6 +207,67 @@ mod tests {
             task("e5", "Reading", 19, 0),
         ];
         assert!(ended_body(&candidates).contains("Reading 19:00"));
+    }
+
+    #[test]
+    fn the_body_escapes_ampersands_in_a_title_so_the_markup_stays_valid() {
+        // Titles are untrusted text straight from Google Calendar's `summary`
+        // field (see `calendar.rs`), and the body is parsed as Pango markup —
+        // this session's own `GetCapabilities` advertises `body-markup`. An
+        // unescaped `&` is invalid XML-ish markup and can garble or drop the
+        // whole body.
+        let candidates = vec![
+            task("e2", "Deep work", 15, 30),
+            task("e3", "Standup", 17, 30),
+            task("e4", "Email", 18, 0),
+            task("e5", "Q&A", 19, 0),
+        ];
+        let body = ended_body(&candidates);
+        assert!(body.contains("Q&amp;A 19:00"), "unescaped ampersand reached the body: {body:?}");
+        assert!(!body.contains("Q&A 19:00"), "the raw, unescaped title must not appear: {body:?}");
+    }
+
+    #[test]
+    fn the_body_escapes_angle_brackets_in_a_title_so_the_markup_stays_valid() {
+        let candidates = vec![
+            task("e2", "Deep work", 15, 30),
+            task("e3", "Standup", 17, 30),
+            task("e4", "Email", 18, 0),
+            task("e5", "<Draft> review", 19, 0),
+        ];
+        let body = ended_body(&candidates);
+        assert!(
+            body.contains("&lt;Draft&gt; review 19:00"),
+            "unescaped angle brackets reached the body: {body:?}"
+        );
+        assert!(!body.contains("<Draft>"), "the raw, unescaped title must not appear: {body:?}");
+    }
+
+    #[test]
+    fn escaping_does_not_double_escape_an_already_present_ampersand_entity() {
+        // Guards the ordering the fix depends on: `&` must be escaped before
+        // `<`/`>`, or an `&lt;` this function itself just produced would be
+        // escaped a second time into `&amp;lt;`.
+        let candidates = vec![
+            task("e2", "Deep work", 15, 30),
+            task("e3", "Standup", 17, 30),
+            task("e4", "Email", 18, 0),
+            task("e5", "<A&B>", 19, 0),
+        ];
+        let body = ended_body(&candidates);
+        assert!(body.contains("&lt;A&amp;B&gt;"), "got: {body:?}");
+        assert!(!body.contains("&amp;lt;"), "double-escaped the entity: {body:?}");
+    }
+
+    #[test]
+    fn action_labels_are_left_unescaped_because_the_spec_does_not_parse_them_as_markup() {
+        // Deliberate, and the opposite of `ended_body`: `actions` labels are
+        // plain text per the Desktop Notifications spec, so escaping them
+        // would corrupt what the user actually sees on the button (turning
+        // `Q&A` into the literal characters `Q&amp;A`), not protect anything.
+        let candidates = vec![task("e2", "Q&A", 15, 30)];
+        let actions = ended_actions(&candidates);
+        assert_eq!(actions[1], "Q&A 15:30", "button labels must stay exactly as Calendar sent them");
     }
 
     #[test]
