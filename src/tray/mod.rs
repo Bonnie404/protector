@@ -29,6 +29,14 @@ pub enum Command {
     /// A notification action button was pressed: select that task, the same
     /// path a menu click on it would take.
     SelectById(String),
+    /// The *Nothing* button on the end-of-task notification was pressed:
+    /// clear the selection, the same outcome as clicking the checked row
+    /// again. A separate variant from `SelectById` because the listener that
+    /// produces it (`notify::forward`) has no task id to hand back — `none`
+    /// is a dismissal, not a selection — and because clearing has to happen
+    /// unconditionally rather than by toggling whatever the id turns out to
+    /// match.
+    ClearSelection,
     /// The stored refresh token was rejected by Google as revoked — distinct
     /// from an ordinary failed sync, which only means the network could not
     /// be reached.

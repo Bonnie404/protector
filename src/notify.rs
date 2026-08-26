@@ -201,6 +201,12 @@ impl ActionSubscription {
             let args = signal.args()?;
             if let Some(id) = action_to_event_id(&args.action_key) {
                 let _ = tx.send(Command::SelectById(id)).await;
+            } else if args.action_key == "none" {
+                // The *Nothing* button: dismiss by clearing the selection,
+                // not by silently doing nothing. Before this, `none` matched
+                // no arm at all and the button just closed the banner while
+                // the countdown it was supposed to stop kept running.
+                let _ = tx.send(Command::ClearSelection).await;
             }
         }
         Ok(())

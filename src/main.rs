@@ -504,6 +504,10 @@ async fn run() -> anyhow::Result<()> {
             // task list changed under the notification) is silently a no-op
             // rather than a crash, exactly as a stale menu id already is.
             Command::SelectById(id) => apply(&mut state, &Action::SelectTask(id)),
+            // The end-of-task notification's *Nothing* button: clear
+            // unconditionally, the same state transition `core::apply`
+            // already gives `Action::ClearSelection`.
+            Command::ClearSelection => apply(&mut state, &Action::ClearSelection),
             // Distinct from an ordinary `Command::Synced(Err(_))`: the
             // refresh token itself is gone, not merely unreachable, so this
             // disconnects outright rather than showing `⚠ Offline`.

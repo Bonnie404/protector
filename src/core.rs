@@ -316,6 +316,14 @@ pub fn apply(state: &mut AppState, action: &Action) -> Vec<Effect> {
             }
             vec![Effect::Persist]
         }
+        // Unconditional, unlike the toggle above: whatever is selected, gone.
+        // Reaches here from the *Nothing* button on the end-of-task
+        // notification, which has no task id to compare against a current
+        // selection — see `Action::ClearSelection`'s own doc comment.
+        Action::ClearSelection => {
+            state.selection = None;
+            vec![Effect::Persist]
+        }
         Action::Refresh => vec![Effect::Sync],
         Action::Connect => vec![Effect::StartLogin],
         Action::Disconnect => {
@@ -504,6 +512,27 @@ mod tests {
         apply(&mut state, &Action::SelectTask("e1".into()));
         assert!(state.selection.is_none());
         assert_eq!(ui(&state, at(14, 6)).label, "Pick a task");
+    }
+
+    #[test]
+    fn clear_selection_clears_unconditionally_whatever_is_selected() {
+        // The path the notification's *Nothing* button takes: it has no task
+        // id to compare against the current selection the way `SelectTask`'s
+        // toggle does, so this has to clear on its own regardless of which
+        // block is selected.
+        let mut state = connected_state();
+        apply(&mut state, &Action::SelectTask("e1".into()));
+        let effects = apply(&mut state, &Action::ClearSelection);
+        assert!(state.selection.is_none());
+        assert_eq!(ui(&state, at(14, 6)).label, "Pick a task");
+        assert!(effects.contains(&Effect::Persist));
+    }
+
+    #[test]
+    fn clear_selection_with_nothing_selected_is_harmless() {
+        let mut state = connected_state();
+        apply(&mut state, &Action::ClearSelection);
+        assert!(state.selection.is_none());
     }
 
     #[test]

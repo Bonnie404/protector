@@ -10,6 +10,13 @@ pub fn own<'a, T: Into<Value<'a>>>(v: T) -> OwnedValue {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
     SelectTask(String),
+    /// Clears whatever is selected, unconditionally — unlike `SelectTask`,
+    /// which only clears when the id named matches the current selection.
+    /// Exists for callers that know they want the selection gone but do not
+    /// know (and should not have to know) what is currently selected: the
+    /// notification listener answering a *Nothing* button press is the one
+    /// case today (`Command::ClearSelection` in `tray::mod`).
+    ClearSelection,
     Refresh,
     Connect,
     Disconnect,

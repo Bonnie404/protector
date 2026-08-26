@@ -313,7 +313,11 @@ async fn pressing_an_action_button_selects_that_task() {
 }
 
 #[tokio::test]
-async fn pressing_nothing_dismisses_without_selecting_anything() {
+async fn pressing_nothing_clears_the_selection() {
+    // The button that used to be inert: `none` matched no arm in `forward`,
+    // so it dismissed the banner and left the countdown running with no way
+    // to stop it short of picking a different block. It must now produce the
+    // same clearing command a click on the checked menu row does.
     let bus = private_bus();
     let (server, client, _calls) = fake_server(&bus).await;
 
@@ -328,19 +332,26 @@ async fn pressing_nothing_dismisses_without_selecting_anything() {
     FakeNotifications::action_invoked(iface_ref.signal_emitter(), 1, "none".into())
         .await
         .unwrap();
-    // Emitted second, from the same connection, so the bus delivers it second:
-    // anything `none` had produced would be queued ahead of it. Waiting for a
-    // command that *must* arrive proves the dismissal produced none, and does
-    // it without betting on how long "nothing happened" takes to observe.
+    let cmd = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .expect("watch_actions must forward the Nothing press")
+        .expect("the channel must still be open");
+    assert!(
+        matches!(cmd, Command::ClearSelection),
+        "the Nothing action must clear the selection, got {cmd:?}"
+    );
+
+    // And it still leaves the listener running for the next press, the same
+    // as any other action.
     FakeNotifications::action_invoked(iface_ref.signal_emitter(), 2, "task:e5".into())
         .await
         .unwrap();
     let cmd = tokio::time::timeout(Duration::from_secs(5), rx.recv())
         .await
-        .expect("the listener must still be running after an ignored dismissal")
+        .expect("the listener must still be running after a Nothing press")
         .expect("the channel must still be open");
     assert!(
         matches!(&cmd, Command::SelectById(id) if id == "e5"),
-        "the Nothing action must not produce a selection, but {cmd:?} arrived before e5"
+        "expected SelectById(\"e5\") after Nothing, got {cmd:?}"
     );
 }
