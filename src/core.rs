@@ -113,6 +113,32 @@ fn item_label(t: &Task) -> String {
     format!("{}   {} \u{2013} {}", t.title, t.start.format("%H:%M"), t.end.format("%H:%M"))
 }
 
+/// The label for a selection pinned above the `Now` section because its id is
+/// in neither `tasks_now` nor `tasks_later` — see the call site in
+/// [`derive_ui`] for why that happens.
+///
+/// Deliberately a static, factual marker (`⚠ ended 15:30`) rather than a live
+/// `+MM:SS` counter: `derive_ui`'s `menu.revision` tracks `state.revision`,
+/// which `apply` and `reconcile` bump but `tick` never does. A live counter
+/// here would either sit stale between syncs — showing `+00:30` forty-five
+/// minutes in — or force a full `LayoutUpdated`/`GetLayout` round trip every
+/// second just to keep one row moving. The live count already lives in the
+/// panel label (`task::panel_label`), which is what the user is actually
+/// watching; this row only has to say *that* the block ended and *when*.
+///
+/// The `t.end > now` branch is for the one other way a selection can end up
+/// absent from both lists: a cold start, where a selection restored from
+/// `state.json` is pinned before the first sync of the run has populated
+/// either list. That block has not ended, and must not be labelled as if it
+/// had — so it renders exactly as an ordinary row would.
+fn pinned_label(t: &Task, now: DateTime<Local>) -> String {
+    if t.end <= now {
+        format!("{}   \u{26a0} ended {}", t.title, t.end.format("%H:%M"))
+    } else {
+        item_label(t)
+    }
+}
+
 fn push_tasks(
     items: &mut Vec<MenuItem>,
     task_ids: &mut TaskIdMemo,
@@ -146,6 +172,32 @@ fn push_tasks(
 pub fn derive_ui(state: &AppState, now: DateTime<Local>, task_ids: &mut TaskIdMemo) -> UiState {
     let mut items = Vec::new();
     let selected_id = state.selection.as_ref().map(|s| s.task.id.as_str());
+
+    // Pin the selection above the Now section when its id is in neither
+    // list — in practice, because it has ended: `calendar::partition` puts a
+    // task in `tasks_now` only while `start <= now < end` and in
+    // `tasks_later` only while `start > now`, so a block that ran out lands
+    // in neither, and `sync::apply_sync`'s `out_of_window` deliberately keeps
+    // the selection alive past that point rather than reading the fetch
+    // window's silence as a deletion. Without this the block simply vanished
+    // from its own menu — taking with it the only way to clear it, since
+    // clearing works by clicking the checked row again.
+    //
+    // Guarded so this is only ever an *addition*: while the block is still in
+    // either list, `push_tasks` below renders it once, checked, in its
+    // ordinary place, and pinning it here too would duplicate the row. The id
+    // is the same one `task_ids` already handed out for it — `id_for` returns
+    // the existing assignment rather than a new one — so the checked row
+    // keeps meaning the same block whether it is drawn here or by
+    // `push_tasks`.
+    if let Some(sel) = state.selection.as_ref() {
+        let listed = state.tasks_now.iter().chain(state.tasks_later.iter()).any(|t| t.id == sel.task.id);
+        if !listed {
+            let id = task_ids.id_for(&sel.task.id);
+            let label = pinned_label(&sel.task, now);
+            items.push(MenuItem::radio(id, &label, true, Action::SelectTask(sel.task.id.clone())));
+        }
+    }
 
     if state.connected {
         if state.tasks_now.is_empty() && state.tasks_later.is_empty() {
@@ -461,6 +513,149 @@ mod tests {
         let ui = ui(&state, at(15, 34));
         assert!(ui.attention);
         assert_eq!(ui.label, "\u{26a0} +04:00 \u{b7} Design review");
+    }
+
+    // ---- Pinning a selection that has dropped out of both lists -------------
+    //
+    // `calendar::partition` puts a task in `tasks_now` only while
+    // `start <= now < end` and in `tasks_later` only while `start > now` — a
+    // block that ended lands in neither, and `sync::apply_sync`'s
+    // `out_of_window` deliberately keeps the selection alive past that point
+    // rather than reading the fetch window's silence as a deletion. Without a
+    // pinned row the block simply vanished from its own menu, taking with it
+    // the only way to clear it (click the checked row again).
+
+    #[test]
+    fn an_ended_selected_block_is_pinned_above_now_checked_once() {
+        let mut state = connected_state();
+        apply(&mut state, &Action::SelectTask("e1".into()));
+        // The shape a real sync leaves behind once e1 ages out of the fetch
+        // window: the selection survives, but e1 is in neither list.
+        state.tasks_now.clear();
+        let ui = ui(&state, at(15, 34));
+
+        let pinned: Vec<_> =
+            ui.menu.items.iter().filter(|i| i.action == Action::SelectTask("e1".into())).collect();
+        assert_eq!(
+            pinned.len(),
+            1,
+            "the ended block must appear exactly once: {:?}",
+            ui.menu.items.iter().map(|i| &i.label).collect::<Vec<_>>()
+        );
+        assert_eq!(pinned[0].radio, Some(true));
+        assert_eq!(pinned[0].label, "Design review   \u{26a0} ended 15:30");
+        assert_eq!(
+            ui.menu.items[0].action,
+            Action::SelectTask("e1".into()),
+            "the pinned row must be the first item, above the Now section"
+        );
+    }
+
+    #[test]
+    fn a_still_running_selected_block_is_not_duplicated_by_pinning() {
+        // The regression a pinned row could easily introduce: e1 is still in
+        // `tasks_now`, so it must appear exactly once, in its normal place.
+        let mut state = connected_state();
+        apply(&mut state, &Action::SelectTask("e1".into()));
+        let ui = ui(&state, at(14, 6));
+        let count =
+            ui.menu.items.iter().filter(|i| i.action == Action::SelectTask("e1".into())).count();
+        assert_eq!(
+            count,
+            1,
+            "a still-running selection must not get a pinned duplicate: {:?}",
+            ui.menu.items.iter().map(|i| &i.label).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn nothing_selected_means_no_pinned_row() {
+        let state = connected_state();
+        let ui = ui(&state, at(14, 6));
+        let task_items =
+            ui.menu.items.iter().filter(|i| matches!(i.action, Action::SelectTask(_))).count();
+        assert_eq!(
+            task_items,
+            2,
+            "e1 and e2 only, no pinned addition: {:?}",
+            ui.menu.items.iter().map(|i| &i.label).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn clicking_the_pinned_row_clears_the_selection() {
+        // `apply`'s `Action::SelectTask` toggle checks the id against the
+        // current selection *before* it looks the task up in either list, so
+        // this needs no change to `apply` — the pinned row's click resolves
+        // to the same action a normal row's would.
+        let mut state = connected_state();
+        apply(&mut state, &Action::SelectTask("e1".into()));
+        state.tasks_now.clear();
+        apply(&mut state, &Action::SelectTask("e1".into()));
+        assert!(state.selection.is_none());
+        assert_eq!(ui(&state, at(15, 34)).label, "Pick a task");
+    }
+
+    #[test]
+    fn the_pinned_rows_id_matches_the_id_it_had_before_it_ended() {
+        let mut ids = TaskIdMemo::default();
+        let mut state = connected_state();
+        apply(&mut state, &Action::SelectTask("e1".into()));
+        let before = derive_ui(&state, at(14, 6), &mut ids).menu;
+        let id_before = id_of(&before, "e1");
+
+        state.tasks_now.clear();
+        let after = derive_ui(&state, at(15, 34), &mut ids).menu;
+        let id_after = id_of(&after, "e1");
+
+        assert_eq!(id_before, id_after, "the pinned row must keep the id the block already had");
+    }
+
+    #[test]
+    fn the_pinned_rows_overtime_marker_is_static_not_a_live_counter() {
+        // `derive_ui`'s `menu.revision` tracks `state.revision`, which
+        // `apply`/`reconcile` bump but `tick` never does. A live `+MM:SS`
+        // marker here would either sit stale between syncs or force a full
+        // menu re-fetch every second just to keep it moving, so the row
+        // states a fact instead: two derivations at very different instants,
+        // both past the end, must read identically.
+        let mut state = connected_state();
+        apply(&mut state, &Action::SelectTask("e1".into()));
+        state.tasks_now.clear();
+        let mut ids = TaskIdMemo::default();
+        let mut label_at = |now| {
+            derive_ui(&state, now, &mut ids)
+                .menu
+                .items
+                .iter()
+                .find(|i| i.action == Action::SelectTask("e1".into()))
+                .unwrap()
+                .label
+                .clone()
+        };
+        let just_after = label_at(at(15, 31));
+        let much_later = label_at(at(16, 20));
+        assert_eq!(just_after, much_later, "the pinned marker must not move with the clock");
+        assert_eq!(just_after, "Design review   \u{26a0} ended 15:30");
+    }
+
+    #[test]
+    fn a_selection_not_yet_seen_by_a_sync_is_pinned_without_claiming_it_ended() {
+        // A cold start: a selection restored from `state.json` before the
+        // first sync has landed is in neither list (both start empty), same
+        // as an ended one — but it has not ended, and must not say so.
+        let mut state = AppState { connected: true, ..Default::default() };
+        state.selection =
+            Some(Selection { task: task("e1", "Design review", (14, 0), (15, 30)), warned: false, ended_notified: false });
+        let ui = ui(&state, at(14, 6));
+        let row = ui
+            .menu
+            .items
+            .iter()
+            .find(|i| i.action == Action::SelectTask("e1".into()))
+            .expect("the selection must still be pinned");
+        assert_eq!(row.label, "Design review   14:00 \u{2013} 15:30");
+        assert!(!row.label.contains("ended"), "must not claim an unended block has ended: {}", row.label);
     }
 
     #[test]
